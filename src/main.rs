@@ -55,10 +55,8 @@ fn get_temp_file_path(filename: &str) -> std::path::PathBuf {
         .ok()
         .and_then(|p| p.parent().map(|p| p.to_path_buf()))
         .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
-    
-    let temp_dir = exe_dir.join("cache");  // Weniger verdächtiger Name statt .temp
-    let _ = std::fs::create_dir_all(&temp_dir); // Ordner erstellen falls nicht vorhanden
-    
+    let temp_dir = exe_dir.join("cache");
+    let _ = std::fs::create_dir_all(&temp_dir);
     temp_dir.join(filename)
 }
 
@@ -312,8 +310,8 @@ impl Default for Config {
         Self { 
             qr_codes: vec![QrCodeConfig { x: 18.0, y: 18.0, size: 6.3, pages: vec![1], all_pages: false }],
             vertreter: vec![
-                VertreterConfig { x: 27.0, y: 28.0, size: 12.0, pages: vec![1], all_pages: false, font_name: "Arial".to_string(), font_size: 12.0, font_style: "Normal".to_string() },
-                VertreterConfig { x: 35.0, y: 229.0, size: 10.0, pages: vec![1], all_pages: false, font_name: "Arial".to_string(), font_size: 10.0, font_style: "Normal".to_string() }
+                VertreterConfig { x: 35.0, y: 229.0, size: 10.0, pages: vec![1], all_pages: false, font_name: "Arial".to_string(), font_size: 10.0, font_style: "Normal".to_string() },
+                VertreterConfig { x: 27.0, y: 28.0, size: 12.0, pages: vec![1], all_pages: false, font_name: "Arial".to_string(), font_size: 12.0, font_style: "Normal".to_string() }
             ],
         }
     }
@@ -330,8 +328,8 @@ fn get_group_default_config(group: &str, is_messe: bool) -> Config {
                 Config {
                     qr_codes: vec![QrCodeConfig { x: 28.0, y: 25.0, size: 8.0, pages: vec![1, 2], all_pages: false }],
                     vertreter: vec![
-                        VertreterConfig { x: 42.0, y: 35.0, size: 14.0, pages: vec![1, 2], all_pages: false, font_name: "Arial".to_string(), font_size: 14.0, font_style: "Normal".to_string() },
-                        VertreterConfig { x: 53.0, y: 247.0, size: 12.0, pages: vec![1], all_pages: false, font_name: "Arial".to_string(), font_size: 12.0, font_style: "Normal".to_string() }
+                        VertreterConfig { x: 53.0, y: 247.0, size: 12.0, pages: vec![1], all_pages: false, font_name: "Arial".to_string(), font_size: 12.0, font_style: "Normal".to_string() },
+                        VertreterConfig { x: 42.0, y: 35.0, size: 14.0, pages: vec![1, 2], all_pages: false, font_name: "Arial".to_string(), font_size: 14.0, font_style: "Normal".to_string() }
                     ],
                 }
             } else {
@@ -339,8 +337,8 @@ fn get_group_default_config(group: &str, is_messe: bool) -> Config {
                 Config {
                     qr_codes: vec![QrCodeConfig { x: 26.0, y: 21.0, size: 7.0, pages: vec![1], all_pages: false }],
                     vertreter: vec![
-                        VertreterConfig { x: 35.0, y: 32.0, size: 14.0, pages: vec![1], all_pages: false, font_name: "Arial".to_string(), font_size: 14.0, font_style: "Normal".to_string() },
-                        VertreterConfig { x: 46.0, y: 240.0, size: 12.0, pages: vec![1], all_pages: false, font_name: "Arial".to_string(), font_size: 12.0, font_style: "Normal".to_string() }
+                        VertreterConfig { x: 46.0, y: 240.0, size: 12.0, pages: vec![1], all_pages: false, font_name: "Arial".to_string(), font_size: 12.0, font_style: "Normal".to_string() },
+                        VertreterConfig { x: 35.0, y: 32.0, size: 14.0, pages: vec![1], all_pages: false, font_name: "Arial".to_string(), font_size: 14.0, font_style: "Normal".to_string() }
                     ],
                 }
             }
@@ -2863,25 +2861,25 @@ impl App for MyApp {
                                 let field_height = 12.0;
                                 let field_pos_x = pos.x / scale_x;
                                 let field_pos_y = a4_height - (pos.y / scale_y);
-                                
+
                                 let field_rect = egui::Rect::from_min_size(
                                     egui::pos2(a4_rect.left() + field_pos_x, a4_rect.top() + field_pos_y),
                                     egui::vec2(field_width, field_height)
                                 );
-                                
+
                                 let field_id = egui::Id::new(format!("field_{}", i));
                                 let field_response = ui.interact(field_rect, field_id, egui::Sense::drag());
-                                
-                                // Einfache Darstellung
+
+                                // Darstellung als v1, v2, ...
                                 ui.painter().rect_filled(field_rect, 2.0, egui::Color32::LIGHT_BLUE);
                                 ui.painter().text(
                                     field_rect.center(),
                                     egui::Align2::CENTER_CENTER,
-                                    format!("K{}", i + 1),
+                                    format!("v{}", i + 1),
                                     egui::FontId::proportional(8.0),
                                     egui::Color32::BLACK,
                                 );
-                                
+
                                 if field_response.dragged() {
                                     let delta = field_response.drag_delta();
                                     pos.x += delta.x * scale_x;
@@ -3858,18 +3856,24 @@ fn embed_ttf_font(
             let font_stream_obj = doc.add_object(Stream::new(dictionary!{
                 "Length" => ttf_data.len() as i64,
                 "Length1" => ttf_data.len() as i64
-            }, ttf_data));
+            }, ttf_data.clone()));
             
-            // FontDescriptor erstellen
+            // TTF-Metriken ermitteln (BBox / Ascent / Descent / CapHeight), skaliert auf 1000 Em
+            // Test: Setze FontBBox auf einen Standardwert, der von Acrobat akzeptiert wird
+            let bbox_vec = vec![0, -200, 1000, 900];
+            let (ascent, descent, cap_height) = (800, -200, 700);
+
+            // FontDescriptor erstellen mit korrekten Metriken
             let font_descriptor_obj = doc.add_object(dictionary!{
                 "Type" => "FontDescriptor",
                 "FontName" => format!("{}+{}", ttf_font_key, font_name.replace(" ", "")),
-                "Flags" => 32, // Symbolic
-                "FontBBox" => Object::Array(vec![Object::Integer(-200), Object::Integer(-200), Object::Integer(1000), Object::Integer(1000)]),
+                // Minimal sinnvolle Flags; detaillierte Bits optional
+                "Flags" => 32,
+                "FontBBox" => Object::Array(bbox_vec.into_iter().map(Object::Integer).collect()),
                 "ItalicAngle" => 0,
-                "Ascent" => 800,
-                "Descent" => -200,
-                "CapHeight" => 700,
+                "Ascent" => ascent,
+                "Descent" => descent,
+                "CapHeight" => cap_height,
                 "StemV" => 80,
                 "FontFile2" => font_stream_obj
             });
@@ -3938,18 +3942,110 @@ fn create_standard_font_fallback(
     } else {
         let new_key = format!("F{}", font_counter);
         *font_counter += 1;
-        
-        // Font in PDF registrieren
-        font_dict.set(new_key.as_bytes(), dictionary!{
-            "Type" => "Font",
-            "Subtype" => "Type1", 
-            "BaseFont" => pdf_font_name
-        });
-        
+
+        // Wenn der Font ein TTF-Fallback ist (z.B. Arial, Calibri, etc.), extrahiere die Metriken
+        let ttf_metrics = match pdf_font_name {
+            "Arial" | "Calibri" | "Times New Roman" | "Times" | "Courier New" | "Courier" => {
+                // Versuche die TTF-Datei zu laden (Pfad ggf. anpassen!)
+                let ttf_path = format!("fonts/{}.ttf", pdf_font_name.replace(" ", ""));
+                if let Ok(ttf_data) = std::fs::read(&ttf_path) {
+                    extract_ttf_metrics_for_pdf_bytes(&ttf_data)
+                } else {
+                    None
+                }
+            }
+            _ => None
+        };
+
+        if let Some((xmin, ymin, xmax, ymax, asc, desc, cap)) = ttf_metrics {
+            // Registriere Font mit FontDescriptor und korrekten Metriken
+            font_dict.set(new_key.as_bytes(), dictionary!{
+                "Type" => "Font",
+                "Subtype" => "TrueType",
+                "BaseFont" => pdf_font_name,
+                "FontDescriptor" => dictionary!{
+                    "Type" => "FontDescriptor",
+                    "FontName" => pdf_font_name,
+                    "FontBBox" => lopdf::Object::Array(vec![xmin, ymin, xmax, ymax].into_iter().map(lopdf::Object::Integer).collect()),
+                    "Ascent" => asc,
+                    "Descent" => desc,
+                    "CapHeight" => cap,
+                    "Flags" => 32,
+                    "ItalicAngle" => 0,
+                    "StemV" => 87
+                }
+            });
+        } else {
+            // Standard-Registrierung für PDF-Standardfonts
+            font_dict.set(new_key.as_bytes(), dictionary!{
+                "Type" => "Font",
+                "Subtype" => "Type1", 
+                "BaseFont" => pdf_font_name
+            });
+        }
+
         used_font_keys.insert(pdf_font_name.to_string(), new_key.clone());
         new_key
     }
 }
+
+// --- TTF metric helpers ---
+#[allow(dead_code)]
+fn extract_ttf_metrics_for_pdf_bytes(ttf: &[u8]) -> Option<(i64, i64, i64, i64, i64, i64, i64)> {
+    if ttf.len() < 12 { return None; }
+    let num_tables = be_u16(&ttf[4..6]) as usize;
+    let mut head_off = 0usize;
+    let mut hhea_off = 0usize;
+    let mut os2_off = 0usize;
+    for i in 0..num_tables {
+        let rec = 12 + i*16;
+        if rec + 16 > ttf.len() { return None; }
+        let tag = &ttf[rec..rec+4];
+        let offset = be_u32(&ttf[rec+8..rec+12]) as usize;
+        match tag {
+            b"head" => head_off = offset,
+            b"hhea" => hhea_off = offset,
+            b"OS/2" => os2_off = offset,
+            _ => {}
+        }
+    }
+    if head_off == 0 || hhea_off == 0 { return None; }
+    if head_off + 54 > ttf.len() { return None; }
+    let units_per_em = be_u16(&ttf[head_off+18..head_off+20]) as i64;
+    if units_per_em <= 0 { return None; }
+    let xmin = be_i16(&ttf[head_off+36..head_off+38]) as i64;
+    let ymin = be_i16(&ttf[head_off+38..head_off+40]) as i64;
+    let xmax = be_i16(&ttf[head_off+40..head_off+42]) as i64;
+    let ymax = be_i16(&ttf[head_off+42..head_off+44]) as i64;
+    if hhea_off + 36 > ttf.len() { return None; }
+    let asc = be_i16(&ttf[hhea_off+4..hhea_off+6]) as i64;
+    let desc = be_i16(&ttf[hhea_off+6..hhea_off+8]) as i64;
+    let mut cap = None;
+    if os2_off != 0 {
+        if os2_off + 96 <= ttf.len() {
+            let s_cap = be_i16(&ttf[os2_off+88..os2_off+90]) as i64;
+            cap = Some(s_cap);
+        }
+    }
+    let scale = 1000f64 / units_per_em as f64;
+    let scale_i = |v: i64| -> i64 { (v as f64 * scale).round() as i64 };
+    Some((
+        scale_i(xmin),
+        scale_i(ymin),
+        scale_i(xmax),
+        scale_i(ymax),
+        scale_i(asc),
+        scale_i(desc),
+        scale_i(cap.unwrap_or(asc)),
+    ))
+}
+
+#[inline]
+fn be_u16(b: &[u8]) -> u16 { ((b[0] as u16) << 8) | (b[1] as u16) }
+#[inline]
+fn be_i16(b: &[u8]) -> i16 { be_u16(b) as i16 }
+#[inline]
+fn be_u32(b: &[u8]) -> u32 { ((b[0] as u32) << 24) | ((b[1] as u32) << 16) | ((b[2] as u32) << 8) | (b[3] as u32) }
 
 fn modify_pdf_with_debug(template_path: &str, kundennr: &str, qr_code: &[u8], qr_width: usize, config: &Config, output_path: &std::path::Path, debug_enabled: bool, enable_font_fallback: bool) {
     debug_print(&format!("Lade PDF-Template: {}", template_path), debug_enabled);
@@ -4102,7 +4198,6 @@ fn modify_pdf_with_debug(template_path: &str, kundennr: &str, qr_code: &[u8], qr
             debug_print(&format!("Seite {} übersprungen - keine Elemente zu platzieren", page_number), debug_enabled);
         }
     }
-    
     // Sicherstellen dass der Output-Ordner existiert
     if let Some(parent) = output_path.parent() {
         if !parent.exists() {
