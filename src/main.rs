@@ -3859,9 +3859,12 @@ fn embed_ttf_font(
             }, ttf_data.clone()));
             
             // TTF-Metriken ermitteln (BBox / Ascent / Descent / CapHeight), skaliert auf 1000 Em
-            // Test: Setze FontBBox auf einen Standardwert, der von Acrobat akzeptiert wird
-            let bbox_vec = vec![0, -200, 1000, 900];
-            let (ascent, descent, cap_height) = (800, -200, 700);
+            // Setze FontBBox für Arial auf korrekten Wert, sonst Standard
+            let (bbox_vec, ascent, descent, cap_height) = if font_name == "Arial" {
+                (vec![-665, -325, 2000, 1006], 905, -210, 728)
+            } else {
+                (vec![0, -200, 1000, 900], 800, -200, 700)
+            };
 
             // FontDescriptor erstellen mit korrekten Metriken
             let font_descriptor_obj = doc.add_object(dictionary!{
@@ -3970,6 +3973,24 @@ fn create_standard_font_fallback(
                     "Ascent" => asc,
                     "Descent" => desc,
                     "CapHeight" => cap,
+                    "Flags" => 32,
+                    "ItalicAngle" => 0,
+                    "StemV" => 87
+                }
+            });
+        } else if pdf_font_name == "Arial" {
+            // Immer korrekten BBox für Arial setzen, falls TTF fehlt
+            font_dict.set(new_key.as_bytes(), dictionary!{
+                "Type" => "Font",
+                "Subtype" => "TrueType",
+                "BaseFont" => pdf_font_name,
+                "FontDescriptor" => dictionary!{
+                    "Type" => "FontDescriptor",
+                    "FontName" => pdf_font_name,
+                    "FontBBox" => lopdf::Object::Array(vec![-665, -325, 2000, 1006].into_iter().map(lopdf::Object::Integer).collect()),
+                    "Ascent" => 905,
+                    "Descent" => -210,
+                    "CapHeight" => 728,
                     "Flags" => 32,
                     "ItalicAngle" => 0,
                     "StemV" => 87
