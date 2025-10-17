@@ -7,8 +7,86 @@ use std::sync::{Arc, Mutex};
 use once_cell::sync::Lazy;
 use std::thread;
 use std::fs;
-use lopdf::{Document, content::{Content, Operation}, dictionary, Object, Stream};
+use std::sync::atomic::{AtomicBool, Ordering};
+use lopdf::{Document, content::{Content, Operation}, dictionary, Object};
 use qrcode::QrCode;
+
+// Funktion um PDF-Vorlage zu laden und als Vorschau zu erstellen
+// NOTE: aktuell nicht in der schnellen Config-Ansicht verwendet; bleibt für optionalen Full-PDF-Preview erhalten
+#[allow(dead_code)]
+fn load_actual_template_for_group(group: &str, language: &str, is_messe: bool) -> Option<(String, lopdf::Document)> {
+    let exe_dir = std::env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(|p| p.to_path_buf()))
+        .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
+    
+    // Try to find template using find_best_template
+    if let Some(template_name) = find_best_template(group, language, if is_messe { Some("messe") } else { None }) {
+        let template_path = exe_dir.join(&template_name);
+        if template_path.exists() {
+            if let Ok(doc) = Document::load(&template_path) {
+                return Some((template_name, doc));
+            }
+        }
+    }
+    
+    // Fallback templates (verwende VORLAGE/-Ordner)
+    let fallback_templates = if is_messe {
+        vec![
+            format!("VORLAGE/Bestellschein-{}-{}_messe.pdf", group, language.to_lowercase()),
+            format!("VORLAGE/Bestellschein-{}-messe.pdf", group),
+            "VORLAGE/Bestellschein-messe.pdf".to_string(),
+        ]
+    } else {
+        vec![
+            format!("VORLAGE/Bestellschein-{}-{}.pdf", group, language.to_lowercase()),
+            format!("VORLAGE/Bestellschein-{}.pdf", group),
+            "VORLAGE/Bestellschein.pdf".to_string(),
+        ]
+    };
+    
+    for template in &fallback_templates {
+        let template_path = exe_dir.join(template);
+        if template_path.exists() {
+            if let Ok(doc) = Document::load(&template_path) {
+                return Some((template.clone(), doc));
+            }
+        }
+    }
+    
+    None
+}
+
+// Funktion um PDF-Vorlage zu laden und als Vorschau zu erstellen  
+fn load_template_preview() -> Option<String> {
+    // Try to use current group selection
+    let exe_dir = std::env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(|p| p.to_path_buf()))
+        .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
+    
+    // Fallback: Try to find any available template in VORLAGE directory
+    let vorlage_dir = exe_dir.join("VORLAGE");
+    println!("Suche Template in: {:?}", vorlage_dir);
+    
+    if let Ok(entries) = std::fs::read_dir(&vorlage_dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if let Some(ext) = path.extension() {
+                if ext == "pdf" {
+                    println!("Gefunden: {:?}", path);
+                    if let Ok(_doc) = Document::load(&path) {
+                        let filename = path.file_name().unwrap().to_string_lossy();
+                        return Some(format!("PDF-Vorlage '{}' erfolgreich geladen", filename));
+                    }
+                }
+            }
+        }
+    }
+    
+    println!("Keine PDF-Vorlagen gefunden in {:?}", vorlage_dir);
+    None
+}
 
 // Debug-Logging-Funktion (nur wenn Debug-Modus aktiv)
 fn debug_log(message: &str, debug_enabled: bool) {
@@ -20,11 +98,6 @@ fn debug_log(message: &str, debug_enabled: bool) {
         
         let log_entry = format!("[{}] {}\n", timestamp, message);
         let log_path = get_temp_file_path("debug.log");
-        
-        // Cache-Ordner sicherheitshalber nochmal explizit erstellen
-        if let Some(parent) = log_path.parent() {
-            let _ = std::fs::create_dir_all(parent);
-        }
         
         // Append zum Log (ignoriere Fehler um Performance nicht zu beeinträchtigen)
         if let Ok(mut file) = std::fs::OpenOptions::new()
@@ -49,14 +122,26 @@ fn debug_print(message: &str, debug_enabled: bool) {
     }
 }
 
+// Globaler Debug-Flag, ermöglicht Debug-Ausgaben auch in Funktionen ohne lokalen Flag-Parameter
+static GLOBAL_DEBUG: Lazy<AtomicBool> = Lazy::new(|| AtomicBool::new(false));
+
+fn debug_print_global(message: &str) {
+    if GLOBAL_DEBUG.load(Ordering::Relaxed) {
+        println!("DEBUG: {}", message);
+        debug_log(message, true);
+    }
+}
+
 // Versteckte Dateipfade für temporäre/interne Dateien (für Nutzer unsichtbar)
 fn get_temp_file_path(filename: &str) -> std::path::PathBuf {
     let exe_dir = std::env::current_exe()
         .ok()
         .and_then(|p| p.parent().map(|p| p.to_path_buf()))
         .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
-    let temp_dir = exe_dir.join("cache");
-    let _ = std::fs::create_dir_all(&temp_dir);
+    
+    let temp_dir = exe_dir.join("cache");  // Weniger verdächtiger Name statt .temp
+    let _ = std::fs::create_dir_all(&temp_dir); // Ordner erstellen falls nicht vorhanden
+    
     temp_dir.join(filename)
 }
 
@@ -210,9 +295,12 @@ fn get_output_dir_for_group_with_debug(group: &str, language: &str, is_messe: bo
         group.to_string()
     };
     
-    let language_folder = match language.to_lowercase().as_str() {
-        "englisch" | "english" | "en" => "EN",
-        _ => "DE", // Kürzer für bessere Übersicht
+    // Unterstütze als Input sowohl UI-Namen ("Deutsch", "Englisch") als auch Sprachcodes ("de_de", "en_us")
+    let lang_low = language.to_lowercase();
+    let language_folder = if lang_low.starts_with("en") || lang_low.contains("engl") || lang_low == "english" {
+        "EN"
+    } else {
+        "DE"
     };
     
     let final_output_dir = output_base.join(group_folder).join(language_folder);
@@ -228,6 +316,64 @@ fn get_output_dir_for_group_with_debug(group: &str, language: &str, is_messe: bo
     }
     
     final_output_dir
+}
+
+// Robustere Spracherkennung: Liefert einen kanonischen Sprachcode wie "de_de" oder "en_us".
+// Reihenfolge: 1) Template-Dateiname (falls angegeben) 2) CSV-Dateiname 3) UI-Auswahl
+fn detect_language_code(ui_language: &str, template_path: Option<&str>, csv_path: Option<&str>) -> String {
+    // Hilfsfunktion zur Normalisierung einfacher Tokens
+    fn norm_token(tok: &str) -> Option<String> {
+        let t = tok.to_lowercase();
+        // Beispiele: de, de_de, en, en_us, german, deutsch, english, englisch
+        if t.starts_with("de") || t.contains("deutsch") || t.contains("german") {
+            return Some("de_de".to_string());
+        }
+        if t.starts_with("en") || t.contains("engl") || t.contains("english") {
+            return Some("en_us".to_string());
+        }
+        None
+    }
+
+    // 1) Versuch: aus Template-Dateiname extrahieren (letztes '-' Segment, außer 'messe')
+    if let Some(tp) = template_path {
+        let stem = std::path::Path::new(tp)
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or(tp);
+        let parts: Vec<&str> = stem.split('-').collect();
+        if !parts.is_empty() {
+            // Suche von hinten: häufig ist letzter Teil der Sprachcode (z.B. de_de, en_us)
+            for part in parts.iter().rev() {
+                let p = part.trim();
+                if p.eq_ignore_ascii_case("messe") { continue; }
+                if let Some(n) = norm_token(p) { return n; }
+                // Manche Dateien nutzen formate wie "de_de" oder "en_us"
+                if p.contains('_') {
+                    let tokens: Vec<&str> = p.split('_').collect();
+                    if let Some(lang_tok) = tokens.get(0) {
+                        if let Some(n2) = norm_token(lang_tok) { return n2; }
+                    }
+                }
+            }
+        }
+    }
+
+    // 2) Versuch: CSV-Pfad auswerten (z.B. names-en.csv)
+    if let Some(cp) = csv_path {
+        let fname = std::path::Path::new(cp)
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or(cp)
+            .to_lowercase();
+        if fname.contains("_en") || fname.contains("english") || fname.contains("-en") { return "en_us".to_string(); }
+        if fname.contains("_de") || fname.contains("deutsch") || fname.contains("-de") { return "de_de".to_string(); }
+    }
+
+    // 3) Fallback: UI-Auswahl
+    if let Some(n) = norm_token(ui_language) { return n; }
+
+    // Default
+    "de_de".to_string()
 }
 
 // Output-Verzeichnis basierend auf Benutzer-Konfiguration bestimmen
@@ -285,7 +431,7 @@ pub struct Config {
 /// Definiert Position, Größe und auf welchen Seiten der QR-Code erscheinen soll.
 #[derive(Clone, Debug)]
 pub struct QrCodeConfig {
-    /// X-Position in Millimetern (von links)
+    /// X-Position in PDF-Punkten (von links)
     pub x: f32,
     pub y: f32,
     pub size: f32,
@@ -308,10 +454,10 @@ pub struct VertreterConfig {
 impl Default for Config {
     fn default() -> Self {
         Self { 
-            qr_codes: vec![QrCodeConfig { x: 18.0, y: 18.0, size: 6.3, pages: vec![1], all_pages: false }],
+            qr_codes: vec![QrCodeConfig { x: 50.0, y: 50.0, size: 18.0, pages: vec![1], all_pages: false }],
             vertreter: vec![
-                VertreterConfig { x: 35.0, y: 229.0, size: 10.0, pages: vec![1], all_pages: false, font_name: "Arial".to_string(), font_size: 10.0, font_style: "Normal".to_string() },
-                VertreterConfig { x: 27.0, y: 28.0, size: 12.0, pages: vec![1], all_pages: false, font_name: "Arial".to_string(), font_size: 12.0, font_style: "Normal".to_string() }
+                VertreterConfig { x: 77.0, y: 80.0, size: 12.0, pages: vec![1], all_pages: false, font_name: "Arial".to_string(), font_size: 12.0, font_style: "Normal".to_string() },
+                VertreterConfig { x: 100.0, y: 650.0, size: 10.0, pages: vec![1], all_pages: false, font_name: "Arial".to_string(), font_size: 10.0, font_style: "Normal".to_string() }
             ],
         }
     }
@@ -324,42 +470,42 @@ fn get_group_default_config(group: &str, is_messe: bool) -> Config {
     match group.to_lowercase().as_str() {
         "apo" | "apotheken" => {
             if is_messe {
-                // Apo Messe - andere Positionen (in mm)
+                // Apo Messe - andere Positionen
                 Config {
-                    qr_codes: vec![QrCodeConfig { x: 28.0, y: 25.0, size: 8.0, pages: vec![1, 2], all_pages: false }],
+                    qr_codes: vec![QrCodeConfig { x: 80.0, y: 70.0, size: 22.0, pages: vec![1, 2], all_pages: false }],
                     vertreter: vec![
-                        VertreterConfig { x: 53.0, y: 247.0, size: 12.0, pages: vec![1], all_pages: false, font_name: "Arial".to_string(), font_size: 12.0, font_style: "Normal".to_string() },
-                        VertreterConfig { x: 42.0, y: 35.0, size: 14.0, pages: vec![1, 2], all_pages: false, font_name: "Arial".to_string(), font_size: 14.0, font_style: "Normal".to_string() }
+                        VertreterConfig { x: 120.0, y: 100.0, size: 14.0, pages: vec![1, 2], all_pages: false, font_name: "Arial".to_string(), font_size: 14.0, font_style: "Normal".to_string() },
+                        VertreterConfig { x: 150.0, y: 700.0, size: 12.0, pages: vec![1], all_pages: false, font_name: "Arial".to_string(), font_size: 12.0, font_style: "Normal".to_string() }
                     ],
                 }
             } else {
-                // Apo Normal - optimiert für Apotheken-Formulare (in mm)
+                // Apo Normal - optimiert für Apotheken-Formulare
                 Config {
-                    qr_codes: vec![QrCodeConfig { x: 26.0, y: 21.0, size: 7.0, pages: vec![1], all_pages: false }],
+                    qr_codes: vec![QrCodeConfig { x: 75.0, y: 60.0, size: 20.0, pages: vec![1], all_pages: false }],
                     vertreter: vec![
-                        VertreterConfig { x: 46.0, y: 240.0, size: 12.0, pages: vec![1], all_pages: false, font_name: "Arial".to_string(), font_size: 12.0, font_style: "Normal".to_string() },
-                        VertreterConfig { x: 35.0, y: 32.0, size: 14.0, pages: vec![1], all_pages: false, font_name: "Arial".to_string(), font_size: 14.0, font_style: "Normal".to_string() }
+                        VertreterConfig { x: 100.0, y: 90.0, size: 14.0, pages: vec![1], all_pages: false, font_name: "Arial".to_string(), font_size: 14.0, font_style: "Normal".to_string() },
+                        VertreterConfig { x: 130.0, y: 680.0, size: 12.0, pages: vec![1], all_pages: false, font_name: "Arial".to_string(), font_size: 12.0, font_style: "Normal".to_string() }
                     ],
                 }
             }
         },
         "endkunde" | "endnutzer" => {
             if is_messe {
-                // Endkunde Messe - angepasst für Messestände (in mm)
+                // Endkunde Messe - angepasst für Messestände
                 Config {
-                    qr_codes: vec![QrCodeConfig { x: 21.0, y: 28.0, size: 8.5, pages: vec![1], all_pages: false }],
+                    qr_codes: vec![QrCodeConfig { x: 60.0, y: 80.0, size: 24.0, pages: vec![1], all_pages: false }],
                     vertreter: vec![
-                        VertreterConfig { x: 32.0, y: 42.0, size: 12.0, pages: vec![1], all_pages: false, font_name: "Arial".to_string(), font_size: 12.0, font_style: "Normal".to_string() },
-                        VertreterConfig { x: 42.0, y: 254.0, size: 10.0, pages: vec![1], all_pages: false, font_name: "Arial".to_string(), font_size: 10.0, font_style: "Normal".to_string() }
+                        VertreterConfig { x: 90.0, y: 120.0, size: 12.0, pages: vec![1], all_pages: false, font_name: "Arial".to_string(), font_size: 12.0, font_style: "Normal".to_string() },
+                        VertreterConfig { x: 120.0, y: 720.0, size: 10.0, pages: vec![1], all_pages: false, font_name: "Arial".to_string(), font_size: 10.0, font_style: "Normal".to_string() }
                     ],
                 }
             } else {
-                // Endkunde Normal - Standard-Layout (in mm)
+                // Endkunde Normal - Standard-Layout
                 Config {
-                    qr_codes: vec![QrCodeConfig { x: 18.0, y: 18.0, size: 6.3, pages: vec![1], all_pages: false }],
+                    qr_codes: vec![QrCodeConfig { x: 50.0, y: 50.0, size: 18.0, pages: vec![1], all_pages: false }],
                     vertreter: vec![
-                        VertreterConfig { x: 27.0, y: 28.0, size: 12.0, pages: vec![1], all_pages: false, font_name: "Arial".to_string(), font_size: 12.0, font_style: "Normal".to_string() },
-                        VertreterConfig { x: 35.0, y: 229.0, size: 10.0, pages: vec![1], all_pages: false, font_name: "Arial".to_string(), font_size: 10.0, font_style: "Normal".to_string() }
+                        VertreterConfig { x: 77.0, y: 80.0, size: 12.0, pages: vec![1], all_pages: false, font_name: "Arial".to_string(), font_size: 12.0, font_style: "Normal".to_string() },
+                        VertreterConfig { x: 100.0, y: 650.0, size: 10.0, pages: vec![1], all_pages: false, font_name: "Arial".to_string(), font_size: 10.0, font_style: "Normal".to_string() }
                     ],
                 }
             }
@@ -642,14 +788,14 @@ fn parse_toml_to_config(toml: &str) -> Config {
         }
     }
 
-    // Defaults setzen wenn nichts gefunden wurde (in mm)
+    // Defaults setzen wenn nichts gefunden wurde
     if qr_codes.is_empty() {
-        qr_codes.push(QrCodeConfig { x: 18.0, y: 18.0, size: 6.3, pages: vec![1], all_pages: false });
+        qr_codes.push(QrCodeConfig { x: 50.0, y: 50.0, size: 18.0, pages: vec![1], all_pages: false });
     }
     if vertreter.is_empty() {
         vertreter = vec![
-            VertreterConfig { x: 27.0, y: 28.0, size: 12.0, pages: vec![1], all_pages: false, font_name: "Arial".to_string(), font_size: 12.0, font_style: "Normal".to_string() },
-            VertreterConfig { x: 35.0, y: 229.0, size: 10.0, pages: vec![1], all_pages: false, font_name: "Arial".to_string(), font_size: 10.0, font_style: "Normal".to_string() },
+            VertreterConfig { x: 77.0, y: 80.0, size: 12.0, pages: vec![1], all_pages: false, font_name: "Arial".to_string(), font_size: 12.0, font_style: "Normal".to_string() },
+            VertreterConfig { x: 100.0, y: 650.0, size: 10.0, pages: vec![1], all_pages: false, font_name: "Arial".to_string(), font_size: 10.0, font_style: "Normal".to_string() },
         ];
     }
     if pages.is_empty() {
@@ -687,7 +833,7 @@ fn save_group_config(group: &str, language: &str, is_messe: bool, config: &Confi
     if is_messe {
         toml.push_str("# Messe-spezifische Konfiguration\n");
     }
-    toml.push_str("# Koordinaten sind in Millimetern (DIN A4: 210×297 mm)\n\n");
+    toml.push_str("# Koordinaten sind in PDF-Punkten (1 Punkt = 1/72 Zoll ≈ 0.35mm)\n\n");
     
     // QR-Codes
     toml.push_str("qr_codes = [\n");
@@ -790,11 +936,6 @@ pub struct MyApp {
     show_settings_dialog: bool,
     // Output directory configuration
     custom_output_dir: String,
-    
-    // Font-Auswahl erweiterte Ansicht
-    show_all_fonts: bool,
-    // Font-Suche
-    font_search_text: String,
     use_custom_output_dir: bool,
     // Template directory configuration
     custom_template_dir: String,
@@ -814,8 +955,6 @@ pub struct MyApp {
     debug_key_pressed: bool, // Flag für Tastatur-Behandlung
     max_threads: usize,     // Thread-Begrenzung für Performance
     thread_sleep_ms: u64,   // Pause zwischen PDF-Generierungen (ms)
-    // Font-System-Konfiguration
-    enable_font_fallback: bool, // Font-Fallback aktiviert (Standard: true)
     // Font-Caching für Performance
     cached_fonts: Vec<String>, // Gecachte Font-Liste
     // Bereichs-Auswahl für Vertreternummern
@@ -824,6 +963,9 @@ pub struct MyApp {
     range_end_index: String,    // End-Index (0-basiert)
     // Resume-Information
     resume_info: Option<(usize, usize, u64)>, // (current_index, total_count, elapsed_seconds)
+    // Selected element in the preview: kind ("qr"/"vertreter") and index
+    selected_element: Option<(String, usize)>,
+    // Full PDF preview state (removed - kept preview lightweight)
 }
 
 impl Default for MyApp {
@@ -853,6 +995,9 @@ impl Default for MyApp {
             let _ = std::fs::write("CONFIG/README.txt", info_text);
             println!("CONFIG Ordner automatisch erstellt mit Info-Datei");
         }
+
+        // Überprüfe ob Template verfügbar ist
+        let _template_loaded = load_template_preview().is_some();
 
         // Migration von globaler zu gruppenspezifischer Config NUR beim ersten Start (einmalig)
         // Diese Funktion prüft intern ob Migration bereits durchgeführt wurde
@@ -932,8 +1077,6 @@ impl Default for MyApp {
             debug_key_pressed: false, // Tastatur-Flag
             max_threads: (std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4) * 3 / 4).max(1), // 75% der verfügbaren Kerne
             thread_sleep_ms: 0,     // 0ms = maximale Geschwindigkeit (kein Sleep)
-            // Font-System Defaults
-            enable_font_fallback: true, // Font-Fallback standardmäßig aktiviert
             // Font-Caching für Performance
             cached_fonts: refresh_font_cache(), // Einmalig beim Start laden (mit Cache)
             // Bereichs-Auswahl Defaults
@@ -942,10 +1085,8 @@ impl Default for MyApp {
             range_end_index: String::new(),
             // Resume-Information (gruppenspezifisch beim Start geladen)
             resume_info: initial_resume_info,
-            // Font-Auswahl erweiterte Ansicht
-            show_all_fonts: false,
-            // Font-Suche
-            font_search_text: String::new(),
+            selected_element: None,
+            // preview state removed
         }
     }
 }
@@ -1198,18 +1339,22 @@ fn find_available_templates_with_score(group: &str, lang: &str, is_messe: bool) 
         if filename_lower.contains(&group.to_lowercase()) {
             score += 10;
         }
-        
-        // Sprache passt
-        let lang_lower = lang.to_lowercase();
-        if lang_lower.contains("deutsch") || lang_lower.contains("de") {
-            if filename_lower.contains("de_de") || filename_lower.contains("de") {
-                score += 8;
-            }
-        } else if lang_lower.contains("englisch") || lang_lower.contains("en") {
-            if filename_lower.contains("en_us") || filename_lower.contains("en") {
-                score += 8;
+
+        // Exakte Kombination Gruppe+Code (z.B. bestellschein-endkunde-en_us) besonders belohnen
+        let preferred_codes = get_preferred_language_codes(lang);
+        if let Some(primary) = preferred_codes.get(0) {
+            // primary may be like "en_us" -> prefix "en"
+            let prefix = primary.split('_').next().unwrap_or(primary).to_string();
+            let group_code_exact1 = format!("{}-{}", group.to_lowercase(), primary.replace(' ', ""));
+            let group_code_exact2 = format!("{}-{}", group.to_lowercase(), prefix);
+            let group_code_exact3 = format!("{}_{}", group.to_lowercase(), prefix);
+            if filename_lower.contains(&group_code_exact1) || filename_lower.contains(&group_code_exact2) || filename_lower.contains(&group_code_exact3) {
+                score += 40;
             }
         }
+        
+        // Sprache passt (verwende robusteren Matcher)
+        score += language_match_score(&filename_lower, lang);
         
         // Messe passt
         if is_messe && filename_lower.contains("messe") {
@@ -1244,11 +1389,7 @@ fn find_available_templates_with_score(group: &str, lang: &str, is_messe: bool) 
                                 if filename_lower.contains(&group.to_lowercase()) {
                                     score += 10;
                                 }
-                                if lang.to_lowercase().contains("deutsch") || lang.to_lowercase().contains("de") {
-                                    if filename_lower.contains("de_de") || filename_lower.contains("de") {
-                                        score += 8;
-                                    }
-                                }
+                                score += language_match_score(&filename_lower, lang);
                                 if is_messe && filename_lower.contains("messe") {
                                     score += 5;
                                 } else if !is_messe && !filename_lower.contains("messe") {
@@ -1265,8 +1406,16 @@ fn find_available_templates_with_score(group: &str, lang: &str, is_messe: bool) 
         }
     }
     
-    // Nach Score sortieren (höchster zuerst)
-    results.sort_by(|a, b| b.1.cmp(&a.1));
+        // Zuerst vorhandene Templates bevorzugen, dann nach Score (höchster zuerst)
+    results.sort_by(|a, b| {
+        // a.2 and b.2 sind 'exists' bools
+        if a.2 == b.2 {
+            b.1.cmp(&a.1)
+        } else {
+            // existierende Dateien zuerst
+            b.2.cmp(&a.2)
+        }
+    });
     results
 }
 
@@ -1276,6 +1425,79 @@ fn capitalize_first(s: &str) -> String {
         None => String::new(),
         Some(f) => f.to_uppercase().collect::<String>() + cs.as_str(),
     }
+}
+
+// Liefert eine priorisierte Liste von Sprachecodes (z.B. ["en_us","en"]) für die gewünschte Sprache
+fn get_preferred_language_codes(request: &str) -> Vec<String> {
+    let r = request.to_lowercase();
+    if r.contains("en") || r.contains("engl") || r.contains("english") {
+        vec!["en_us".to_string(), "en".to_string()]
+    } else if r.contains("fr") || r.contains("franz") || r.contains("french") {
+        vec!["fr_fr".to_string(), "fr".to_string()]
+    } else if r.contains("de") || r.contains("deut") || r.contains("german") || r.contains("deutsch") {
+        vec!["de_de".to_string(), "de".to_string()]
+    } else if r.contains('_') {
+        vec![r]
+    } else {
+        vec!["de_de".to_string(), "de".to_string()]
+    }
+}
+
+// Prüfe ob ein Token isoliert im Dateinamen vorkommt (z.B. -en-, _en_, en. oder am Ende/Anfang),
+// ohne dass es Teil eines größeren Wortes ist (vermeidet Matches in "endkunde").
+fn isolated_token_present(haystack: &str, token: &str) -> bool {
+    if token.is_empty() { return false; }
+    let hay = haystack;
+    let t = token;
+    let mut start = 0usize;
+    while let Some(idx) = hay[start..].find(t) {
+        let pos = start + idx;
+        // vorheriges Zeichen
+        let prev_ok = if pos == 0 { true } else { !hay.as_bytes()[pos - 1].is_ascii_alphabetic() };
+        // nachfolgendes Zeichen
+        let after_pos = pos + t.len();
+        let next_ok = if after_pos >= hay.len() { true } else { !hay.as_bytes()[after_pos].is_ascii_alphabetic() };
+        if prev_ok && next_ok { return true; }
+        start = pos + 1;
+    }
+    false
+}
+
+// Berechne Sprach-Matching-Score für einen Dateinamen.
+// Stellt sicher, dass exakte Sprachcodes (z.B. "en_us") höher bewertet werden
+// und vermeidet falsche Treffer durch einfache Substring-Suchen (z.B. "de" in "default").
+fn language_match_score(filename_lower: &str, lang: &str) -> i32 {
+    // (moved to top-level) See get_preferred_language_codes
+
+    // Known language codes - extend here when adding new languages
+    let known_codes: Vec<&str> = vec!["en_us", "en", "de_de", "de", "fr_fr", "fr"];
+    let preferred = get_preferred_language_codes(lang);
+
+    let mut score = 0;
+
+    for code in known_codes.iter() {
+        // check for precise tokens: -code, _code, code. or -code-
+        let token_precise = filename_lower.contains(&format!("-{}", code))
+            || filename_lower.contains(&format!("_{}", code))
+            || filename_lower.contains(&format!("{}.", code))
+            || filename_lower.contains(&format!("-{}-", code));
+
+        let token_loose = filename_lower.contains(code);
+
+        if preferred.iter().any(|p| p == code) {
+            // higher weight for preferred codes; earlier preferred codes get slightly more
+            let pos = preferred.iter().position(|c| c == code).unwrap_or(0) as i32;
+            let base = 30 - pos * 4; // 30, 26, ... for decreasing preference
+            if token_precise { score += base; }
+            else if token_loose { score += base / 2; }
+        } else {
+            // Not preferred: penalize precise other-language tags so they don't tie with preferred
+            if token_precise { score -= 8; }
+            else if token_loose { score -= 2; }
+        }
+    }
+
+    score
 }
 
 // Lade gruppenspezifische Config-Datei, falls vorhanden.
@@ -1440,13 +1662,71 @@ impl MyApp {
 
     // Template-Suche basierend auf User-Settings
     fn find_template(&self, group: &str, lang: &str, country: Option<&str>) -> Option<String> {
+        // Prefer using the scored template list so automatic selection respects preferred language codes
+        let templates = self.find_templates_with_score(group, lang, country.is_some() && country.unwrap_or("") == "messe");
+
+        if !templates.is_empty() {
+            // preferred codes (e.g. en_us, en)
+            let preferred = get_preferred_language_codes(lang);
+
+            // 1) try to find existing template that contains preferred code (primary or prefix)
+            for (t, _s, exists) in templates.iter() {
+                if !*exists { continue; }
+                let t_low = t.to_lowercase();
+                for p in &preferred {
+                    let prefix = p.split('_').next().unwrap_or(p);
+                    if t_low.contains(p) || t_low.contains(prefix) {
+                        return Some(t.clone());
+                    }
+                }
+            }
+
+            // 2) otherwise return highest-scoring existing template
+            for (t, _s, exists) in templates.iter() {
+                if *exists { return Some(t.clone()); }
+            }
+
+            // 3) fallback to first candidate (even if missing)
+            return templates.first().map(|(t, _s, _e)| t.clone());
+        }
+
+        // If no scored templates (edge case), fallback to original search
         if self.use_custom_template_dir {
-            // Benutzerdefinierter Ordner
             find_best_template_in_dir(group, lang, country, &self.custom_template_dir)
         } else {
-            // Standard-Logik (VORLAGE-Ordner)
             find_best_template(group, lang, country)
         }
+    }
+
+    // Wähle automatisch das beste Template (wie in der UI angezeigt):
+    // 1) Vorzugsweise vorhandene Template mit preferred language code
+    // 2) sonst erstes vorhandenes Template
+    // 3) sonst erstes Kandidaten-Template
+    fn select_best_template_auto(&self, group: &str, lang: &str, is_messe: bool) -> Option<String> {
+        let templates = self.find_templates_with_score(group, lang, is_messe);
+        if templates.is_empty() { return None; }
+
+        let preferred_codes = get_preferred_language_codes(lang);
+
+        // 1) existing template containing preferred code
+        for (t, _s, exists) in templates.iter() {
+            if !*exists { continue; }
+            let t_low = t.to_lowercase();
+                for p in &preferred_codes {
+                    let prefix = p.split('_').next().unwrap_or(p);
+                    if isolated_token_present(&t_low, p) || isolated_token_present(&t_low, prefix) {
+                        return Some(t.clone());
+                    }
+                }
+        }
+
+        // 2) first existing template
+        for (t, _s, exists) in templates.iter() {
+            if *exists { return Some(t.clone()); }
+        }
+
+        // 3) first candidate (even if missing)
+        templates.first().map(|(t, _s, _e)| t.clone())
     }
 
     // Template-Liste mit Scoring basierend auf User-Settings
@@ -1503,9 +1783,12 @@ impl MyApp {
                                     score += 15;
                                 }
                                 
-                                // Höhere Priorität für exakte Matches
-                                if filename_lower.contains(&format!("{}-{}", group.to_lowercase(), lang_lower)) {
-                                    score += 20;
+                                // Höhere Priorität für exakte Matches (Gruppe+Lang) - benutze primären Preferred-Code
+                                let preferred_codes = get_preferred_language_codes(lang);
+                                if let Some(primary) = preferred_codes.get(0) {
+                                    if filename_lower.contains(&format!("{}-{}", group.to_lowercase(), primary.replace(' ', ""))) {
+                                        score += 40;
+                                    }
                                 }
                                 
                                 results.push((relative_path, score, true)); // exists = true (wir haben es gescannt)
@@ -1516,8 +1799,14 @@ impl MyApp {
             }
         }
         
-        // Nach Score sortieren (höchster zuerst)
-        results.sort_by(|a, b| b.1.cmp(&a.1));
+    // Zuerst vorhandene Templates bevorzugen, dann nach Score (höchster zuerst)
+    results.sort_by(|a, b| {
+        if a.2 == b.2 {
+            b.1.cmp(&a.1)
+        } else {
+            b.2.cmp(&a.2)
+        }
+    });
         results
     }
 }
@@ -1568,6 +1857,57 @@ impl App for MyApp {
             self.resume_needs_update = false;
             println!("Resume-Status aktualisiert: {} verfügbar, {} PDFs", 
                      self.resume_available, self.last_processed_count);
+        }
+
+        // Keyboard nudging for selected preview element: Arrow keys move selected element.
+        // Use 1 UI-pixel per press as base, Shift => 10 pixels. Convert UI pixels to PDF points
+        // using the same scale as the preview: PDF A4 ~595x842 mapped to ui a4 size.
+        let a4_width = 350.0_f32;
+        let a4_height = 495.0_f32;
+        let scale_x = 595.0_f32 / a4_width; // PDF points per UI pixel horizontally
+        let scale_y = 842.0_f32 / a4_height; // PDF points per UI pixel vertically
+
+        let ui_move_pixels = if ctx.input(|i| i.modifiers.shift) { 10.0 } else { 1.0 };
+
+        // Movement amounts in PDF points
+        let pdf_move_x = ui_move_pixels * scale_x;
+        let pdf_move_y = ui_move_pixels * scale_y;
+
+        // Arrow keys: allow continuous movement while key is down
+    let left = ctx.input(|i| i.key_down(egui::Key::ArrowLeft));
+    let right = ctx.input(|i| i.key_down(egui::Key::ArrowRight));
+    let up = ctx.input(|i| i.key_down(egui::Key::ArrowUp));
+    let down = ctx.input(|i| i.key_down(egui::Key::ArrowDown));
+
+        if left || right || up || down {
+            if let Some((ref kind, idx)) = self.selected_element.clone() {
+                let dx = if left { -pdf_move_x } else if right { pdf_move_x } else { 0.0 };
+                let dy = if up { pdf_move_y } else if down { -pdf_move_y } else { 0.0 };
+
+                if kind == "qr" {
+                    if let Some(qr) = self.config.qr_codes.get_mut(idx) {
+                        qr.x = (qr.x + dx).max(0.0).min(595.0 - qr.size);
+                        qr.y = (qr.y + dy).max(0.0).min(842.0 - qr.size);
+                        // update manual fields for immediate feedback
+                        if idx == 0 {
+                            self.manual_qr_x = format!("{:.1}", qr.x);
+                            self.manual_qr_y = format!("{:.1}", qr.y);
+                            self.manual_qr_size = format!("{:.1}", qr.size);
+                        }
+                    }
+                } else if kind == "vertreter" {
+                    if let Some(v) = self.config.vertreter.get_mut(idx) {
+                        v.x = (v.x + dx).max(0.0).min(595.0 - v.size);
+                        v.y = (v.y + dy).max(0.0).min(842.0 - v.size);
+                        // update manual vertreter fields only for first
+                        if idx == 0 {
+                            self.manual_vertreter_x = format!("{:.1}", v.x);
+                            self.manual_vertreter_y = format!("{:.1}", v.y);
+                            self.manual_vertreter_size = format!("{:.1}", v.size);
+                        }
+                    }
+                }
+            }
         }
 
         egui::TopBottomPanel::top("top_panel").show(ctx, |ui| {
@@ -1740,17 +2080,17 @@ impl App for MyApp {
                         // Sichere Auswahl der Dateien
                         let selections = match get_current_selections() {
                             Some(s) => {
-                                println!("DEBUG: Verwende gespeicherte Auswahl: {:?}", s);
+                                debug_print_global(&format!("Verwende gespeicherte Auswahl: {:?}", s));
                                 s
                             },
                             None => {
-                                println!("DEBUG: Keine Auswahl gefunden, verwende Standard");
+                                debug_print_global("Keine Auswahl gefunden, verwende Standard");
                                 get_default_selections()
                             }
                         };
                         
                         let csv_path = selections.get(0).map(|s| s.0.clone()).unwrap_or_else(|| get_default_csv_path("Endkunde"));
-                        println!("DEBUG: CSV-Pfad: {}", csv_path);
+                        debug_print_global(&format!("CSV-Pfad: {}", csv_path));
                         
                         // Prüfe ob CSV-Datei existiert
                         if !std::path::Path::new(&csv_path).exists() {
@@ -1761,7 +2101,7 @@ impl App for MyApp {
                         
                         let vertreter_vec = match std::panic::catch_unwind(|| read_vertreter(&csv_path)) {
                             Ok(vertreter) => {
-                                println!("DEBUG: {} Vertreter geladen", vertreter.len());
+                                debug_print_global(&format!("{} Vertreter geladen", vertreter.len()));
                                 vertreter
                             },
                             Err(e) => {
@@ -1803,9 +2143,9 @@ impl App for MyApp {
                         let dirs_result = std::panic::catch_unwind(|| get_release_dirs());
                         let (_cfg_dir, data_dir, templates_dir, _tools, _out) = match dirs_result {
                             Ok(dirs) => {
-                                println!("DEBUG: Ordner erfolgreich ermittelt");
-                                println!("DEBUG: Data-Dir: {}", dirs.1.display());
-                                println!("DEBUG: Templates-Dir: {}", dirs.2.display());
+                                debug_print_global("Ordner erfolgreich ermittelt");
+                                debug_print_global(&format!("Data-Dir: {}", dirs.1.display()));
+                                debug_print_global(&format!("Templates-Dir: {}", dirs.2.display()));
                                 dirs
                             },
                             Err(e) => {
@@ -1824,8 +2164,6 @@ impl App for MyApp {
                         // Performance-Parameter klonen
                         let thread_sleep_ms = self.thread_sleep_ms;
                         let debug_mode = self.debug_mode;
-                        // Font-Fallback Parameter klonen
-                        let enable_font_fallback = self.enable_font_fallback;
 
                         thread::spawn(move || {
                             if let Err(e) = generate_bestellscheine_resume(
@@ -1849,8 +2187,6 @@ impl App for MyApp {
                                 use_range_selection,
                                 range_start_parsed,
                                 range_end_parsed,
-                                // Font-Fallback Parameter
-                                enable_font_fallback,
                             ) {
                                 eprintln!("Fehler beim Erstellen der Bestellscheine: {}", e);
                             }
@@ -1931,8 +2267,6 @@ impl App for MyApp {
                                     false, // use_range
                                     0,     // range_start
                                     total.saturating_sub(1), // range_end
-                                    // Font-Fallback Parameter - Thread 2
-                                    true, // TODO: self.enable_font_fallback durch Clone ersetzen
                                 ) {
                                     eprintln!("Fehler beim Erstellen der Bestellscheine: {}", e);
                                 }
@@ -2015,8 +2349,6 @@ impl App for MyApp {
                                     false, // use_range
                                     0,     // range_start
                                     total.saturating_sub(1), // range_end
-                                    // Font-Fallback Parameter - Thread 3
-                                    true, // TODO: self.enable_font_fallback durch Clone ersetzen
                                 ) {
                                     eprintln!("Fehler beim Erstellen der Bestellscheine: {}", e);
                                 }
@@ -2138,6 +2470,27 @@ impl App for MyApp {
                                 self.manual_vertreter_y = format!("{:.1}", self.config.vertreter[0].y);
                             }
                             println!("Gruppe geändert zu Apo - Config neu geladen");
+                        }
+                        if ui.selectable_label(self.selected_group == "Fachkreise", "Fachkreise").clicked() {
+                            // Alte Progress-Dateien löschen bei Kategorie-Wechsel
+                            clear_progress_files(&self.selected_group, &self.selected_language, self.is_messe);
+                            self.selected_group = "Fachkreise".to_string();
+                            // Resume-Info für neue Kategorie laden
+                            self.resume_info = load_resume_info(&self.selected_group, &self.selected_language, self.is_messe);
+                            // Sofort gruppenspezifische Config laden
+                            let group_cfg = load_group_config(&self.selected_group, &self.selected_language, self.is_messe);
+                            self.config = group_cfg;
+                            // Update manual input fields with loaded values
+                            if !self.config.qr_codes.is_empty() {
+                                self.manual_qr_x = format!("{:.1}", self.config.qr_codes[0].x);
+                                self.manual_qr_y = format!("{:.1}", self.config.qr_codes[0].y);
+                                self.manual_qr_size = format!("{:.1}", self.config.qr_codes[0].size);
+                            }
+                            if !self.config.vertreter.is_empty() {
+                                self.manual_vertreter_x = format!("{:.1}", self.config.vertreter[0].x);
+                                self.manual_vertreter_y = format!("{:.1}", self.config.vertreter[0].y);
+                            }
+                            println!("Gruppe geändert zu Fachkreise - Config neu geladen");
                         }
                     });
 
@@ -2281,10 +2634,43 @@ impl App for MyApp {
                         if self.show_template_selection {
                             ui.label("👆 Wählen Sie ein Template aus der Liste oben aus");
                         } else {
-                            let auto_template = templates_with_score.first();
-                            if let Some((template, _score, exists)) = auto_template {
+                            // Wähle automatisch: bevorzuge eine existierende Vorlage, die einen preferred language code enthält
+                            let preferred_codes = get_preferred_language_codes(&self.selected_language);
+                            let mut chosen: Option<(&String, &i32, &bool)> = None;
+
+                            // 1) Suche existierende Templates mit preferred code (primary or prefix)
+                            for (t, s, e) in templates_with_score.iter() {
+                                if !*e { continue; }
+                                let t_low = t.to_lowercase();
+                                let mut matches_pref = false;
+                                for p in &preferred_codes {
+                                    let prefix = p.split('_').next().unwrap_or(p);
+                                    if isolated_token_present(&t_low, p) || isolated_token_present(&t_low, prefix) {
+                                        matches_pref = true; break;
+                                    }
+                                }
+                                if matches_pref {
+                                    chosen = Some((t, s, e)); break;
+                                }
+                            }
+
+                            // 2) Falls nicht gefunden: erstes existierendes Template
+                            if chosen.is_none() {
+                                for (t, s, e) in templates_with_score.iter() {
+                                    if *e { chosen = Some((t, s, e)); break; }
+                                }
+                            }
+
+                            // 3) Falls immer noch nicht gefunden: das erste Kandidat (auch wenn nicht existierend)
+                            if chosen.is_none() {
+                                if let Some((t, s, e)) = templates_with_score.first() {
+                                    chosen = Some((t, s, e));
+                                }
+                            }
+
+                            if let Some((template, score, exists)) = chosen {
                                 let status = if *exists { "✅ gefunden" } else { "❌ fehlt" };
-                                ui.label(format!("🤖 Automatische Wahl: {} - {}", template, status));
+                                ui.label(format!("🤖 Automatische Wahl: {} (Score: {}) - {}", template, score, status));
                             }
                         }
                     }
@@ -2325,9 +2711,9 @@ impl App for MyApp {
                                     return; // Früh beenden, Dialog offen lassen
                                 }
                             } else {
-                                // Automatische Erkennung verwenden
-                                self.find_template(&self.selected_group, &self.selected_language, if self.is_messe { Some("messe") } else { None })
-                                    .unwrap_or_else(|| if self.selected_group == "Apo" { "VORLAGE/Bestellscheine-Apo.pdf".to_string() } else { "VORLAGE/Bestellschein-Endkunde-de_de.pdf".to_string() })
+                                // Automatische Erkennung verwenden (jetzt: best-scoring + preferred language)
+                                    self.select_best_template_auto(&self.selected_group, &self.selected_language, self.is_messe)
+                                        .unwrap_or_else(|| if self.selected_group == "Apo" { "VORLAGE/Bestellscheine-Apo.pdf".to_string() } else { "VORLAGE/Bestellschein-Endkunde-de_de.pdf".to_string() })
                             };
                             
                             let gen_qr = true;
@@ -2506,7 +2892,7 @@ impl App for MyApp {
                         ui.add_space(10.0);
                         ui.separator();
                         ui.label(egui::RichText::new("Bestellschein Generator").size(14.0).strong());
-                        ui.label(egui::RichText::new("Version 1").size(12.0));
+                        ui.label(egui::RichText::new("Version 0.3.2").size(12.0));
                         ui.add_space(5.0);
                         ui.label(egui::RichText::new("Programmentwicklung: Alexander Löschke, IT - Abteilung")
                             .strong()
@@ -2517,6 +2903,8 @@ impl App for MyApp {
                         if ctx.input(|i| i.modifiers.ctrl && i.modifiers.shift && i.key_pressed(egui::Key::D)) {
                             if !self.debug_key_pressed {
                                 self.debug_mode = !self.debug_mode; // Toggle Debug-Modus
+                                // Setze globalen Debug-Flag damit zentrale Logs sichtbar werden
+                                GLOBAL_DEBUG.store(self.debug_mode, Ordering::Relaxed);
                                 save_debug_config(self.debug_mode); // Persistieren des Debug-Status
                                 self.debug_key_pressed = true;
                             }
@@ -2528,7 +2916,11 @@ impl App for MyApp {
                             ui.separator();
                             ui.label(egui::RichText::new("🔧 Erweiterte Einstellungen (Debug-Modus)").size(12.0).color(egui::Color32::RED));
                             
-                            ui.checkbox(&mut self.debug_mode, "Debug-Modus aktivieren (Log-Datei)");
+                            if ui.checkbox(&mut self.debug_mode, "Debug-Modus aktivieren (Log-Datei)").clicked() {
+                                // Checkbox hat geändert: setze GLOBAL_DEBUG und persist
+                                GLOBAL_DEBUG.store(self.debug_mode, Ordering::Relaxed);
+                                save_debug_config(self.debug_mode);
+                            }
                             if self.debug_mode {
                                 ui.label("📝 Debug-Informationen werden in cache/debug.log gespeichert");
                                 if ui.button("🗂️ Log-Datei öffnen").clicked() {
@@ -2548,17 +2940,6 @@ impl App for MyApp {
                                 ui.add(egui::Slider::new(&mut self.thread_sleep_ms, 0..=5).suffix(" ms"));
                                 ui.label("(nur 0-2ms aktiv)");
                             });
-                            
-                            ui.separator();
-                            ui.label("🔤 Font-System-Einstellungen:");
-                            ui.checkbox(&mut self.enable_font_fallback, "Font-Fallback aktivieren");
-                            if self.enable_font_fallback {
-                                ui.label("✓ Wenn Custom Font nicht gefunden → Standard-Font (Times, Helvetica, Courier)");
-                            } else {
-                                ui.label("❌ Nur echte Custom Fonts verwenden (keine Standard-Font-Fallbacks)");
-                                ui.label(egui::RichText::new("⚠ Warnung: Fehlende Fonts können zu Fehlern führen").size(11.0).color(egui::Color32::from_rgb(255, 165, 0)));
-                            }
-                            
                             ui.label("💡 Weniger Threads = geringere CPU-Last, mehr Threads = schneller");
                             ui.label("⚡ Thread-Pause >2ms deaktiviert für maximale Geschwindigkeit");
                         }
@@ -2725,7 +3106,7 @@ impl App for MyApp {
                 }
                 
                 let mut show_config = self.show_config;
-                let _window_response = egui::Window::new("Positionen auf DIN A4 konfigurieren")
+                egui::Window::new("Positionen auf DIN A4 konfigurieren")
                     .open(&mut show_config)
                     .resizable(true)
                     .default_size([800.0, 600.0])
@@ -2742,156 +3123,272 @@ impl App for MyApp {
                                 }
                             });
                             
-                            // PERFORMANCE: Kleinere DIN A4 Darstellung für bessere Performance
-                            let a4_width = 280.0;  // Reduziert von 350
-                            let a4_height = 396.0; // 280 * 1.414
+                            // DIN A4 Verhältnis: 210mm x 297mm ≈ 1:1.414
+                            let a4_width = 350.0;
+                            let a4_height = 495.0; // 350 * 1.414
                             
-                            // Bereich für DIN A4 Darstellung reservieren - OHNE drag sense für bessere Performance
+                            // Bereich für DIN A4 Darstellung reservieren
                             let (a4_rect, _a4_response) = ui.allocate_exact_size(
                                 egui::vec2(a4_width, a4_height), 
-                                egui::Sense::hover() // NUR hover, kein drag
+                                egui::Sense::drag()
                             );
                             
-                            // Template-Info anzeigen statt PDF-Rendering - NUR MILLIMETER-RASTER!
-                            
-                            // A4-Hintergrund mit Millimeter-Raster
+                            // DIN A4 Hintergrund mit erweiterten Vorlagen-Design zeichnen
                             ui.painter().rect_filled(a4_rect, 5.0, egui::Color32::WHITE);
                             ui.painter().rect_stroke(a4_rect, 5.0, egui::Stroke::new(2.0, egui::Color32::BLACK));
                             
-                            // Millimeter-Raster zeichnen (alle 10mm eine Linie)
-                            let mm_to_pixel_x = a4_width / 210.0;  // 210mm A4 Breite
-                            let mm_to_pixel_y = a4_height / 297.0; // 297mm A4 Höhe
-                            
-                            // Vertikale Linien (alle 10mm)
-                            for mm in (10..210).step_by(10) {
-                                let x_pos = a4_rect.left() + mm as f32 * mm_to_pixel_x;
-                                let color = if mm % 50 == 0 { 
-                                    egui::Color32::from_rgb(150, 150, 150) 
-                                } else { 
-                                    egui::Color32::from_rgb(220, 220, 220) 
-                                };
-                                ui.painter().line_segment(
-                                    [egui::pos2(x_pos, a4_rect.top()), egui::pos2(x_pos, a4_rect.bottom())],
-                                    egui::Stroke::new(if mm % 50 == 0 { 1.0 } else { 0.5 }, color)
-                                );
-                                
-                                // Beschriftung alle 50mm
-                                if mm % 50 == 0 {
-                                    ui.painter().text(
-                                        egui::pos2(x_pos, a4_rect.top() + 10.0),
-                                        egui::Align2::CENTER_TOP,
-                                        format!("{}mm", mm),
-                                        egui::FontId::proportional(8.0),
-                                        egui::Color32::from_rgb(100, 100, 100),
-                                    );
+                            // Lightweight: Prüfe, ob eine passende Template-Datei vorhanden ist (ohne das PDF zu laden)
+                            let (_, _, templates_dir, _, _) = get_release_dirs_with_debug(self.debug_mode);
+                            let mut template_found: Option<String> = None;
+                            if let Ok(entries) = std::fs::read_dir(&templates_dir) {
+                                for e in entries.flatten() {
+                                    if let Some(fname) = e.file_name().to_str() {
+                                        let fname_l = fname.to_lowercase();
+                                        // grobe Suche: enthält Gruppenname und ggf. Sprachkürzel
+                                        let grp = self.selected_group.to_lowercase();
+                                        let lang_prefix = self.selected_language.chars().take(2).collect::<String>().to_lowercase();
+                                        if fname_l.contains(&grp) && (fname_l.contains(&lang_prefix) || fname_l.contains(&"de") || fname_l.contains(&"en")) {
+                                            template_found = Some(fname.to_string());
+                                            break;
+                                        }
+                                    }
                                 }
                             }
+                            let (template_status, template_loaded) = if let Some(ref name) = template_found {
+                                (format!("✅ Template vorhanden: {}", name), true)
+                            } else {
+                                (format!("⚠️ Keine Template-Datei für {} {} (Messe: {}) gefunden", self.selected_group, self.selected_language, self.is_messe), false)
+                            };
                             
-                            // Horizontale Linien (alle 10mm)
-                            for mm in (10..297).step_by(10) {
-                                let y_pos = a4_rect.top() + mm as f32 * mm_to_pixel_y;
-                                let color = if mm % 50 == 0 { 
-                                    egui::Color32::from_rgb(150, 150, 150) 
-                                } else { 
-                                    egui::Color32::from_rgb(220, 220, 220) 
-                                };
-                                ui.painter().line_segment(
-                                    [egui::pos2(a4_rect.left(), y_pos), egui::pos2(a4_rect.right(), y_pos)],
-                                    egui::Stroke::new(if mm % 50 == 0 { 1.0 } else { 0.5 }, color)
-                                );
-                                
-                                // Beschriftung alle 50mm
-                                if mm % 50 == 0 {
-                                    ui.painter().text(
-                                        egui::pos2(a4_rect.left() + 5.0, y_pos),
-                                        egui::Align2::LEFT_CENTER,
-                                        format!("{}mm", mm),
-                                        egui::FontId::proportional(8.0),
-                                        egui::Color32::from_rgb(100, 100, 100),
-                                    );
-                                }
+                            // CSV-Datei-Status überprüfen
+                            let csv_path = if self.selected_group == "Apo" { 
+                                get_default_csv_path("Apo") 
+                            } else { 
+                                get_default_csv_path("Endkunde") 
+                            };
+                            
+                            let (_, data_dir, _, _, _) = get_release_dirs_with_debug(self.debug_mode);
+                            let full_csv_path = data_dir.join(&csv_path.replace("Data/", ""));
+                            let csv_exists = full_csv_path.exists();
+                            let csv_status = if csv_exists {
+                                format!("✅ CSV-Datei gefunden: {}", csv_path)
+                            } else {
+                                format!("❌ CSV-Datei fehlt: {} (erwartet: {})", csv_path, full_csv_path.display())
+                            };
+                            
+                            // Lightweight schematic: draw A4 grid in millimeters and overlay configured QR boxes.
+                            // This is cheap and avoids loading the full PDF template.
+                            let margin = 12.0;
+                            let inner_rect = egui::Rect::from_min_size(
+                                egui::pos2(a4_rect.left() + margin, a4_rect.top() + margin),
+                                egui::vec2(a4_width - 2.0 * margin, a4_height - 2.0 * margin)
+                            );
+
+                            // Draw pale background and border
+                            ui.painter().rect_filled(inner_rect, 3.0, egui::Color32::from_rgb(250, 250, 250));
+                            ui.painter().rect_stroke(inner_rect, 3.0, egui::Stroke::new(1.0, egui::Color32::from_rgb(200, 200, 200)));
+
+                            // A4 in mm: 210 x 297
+                            let a4_mm_w = 210.0;
+                            let a4_mm_h = 297.0;
+                            let mm_to_ui_x = inner_rect.width() / a4_mm_w;
+                            let mm_to_ui_y = inner_rect.height() / a4_mm_h;
+
+                            // Draw grid lines every 10 mm (lighter every 10, darker every 50)
+                            for mm in (0..=210).step_by(5) {
+                                let x = inner_rect.left() + (mm as f32) * mm_to_ui_x;
+                                let color = if mm % 50 == 0 { egui::Color32::from_gray(200) } else if mm % 10 == 0 { egui::Color32::from_gray(220) } else { egui::Color32::from_gray(235) };
+                                ui.painter().line_segment([egui::pos2(x, inner_rect.top()), egui::pos2(x, inner_rect.bottom())], egui::Stroke::new(1.0, color));
                             }
+                            for mm in (0..=297).step_by(5) {
+                                let y = inner_rect.top() + (mm as f32) * mm_to_ui_y;
+                                let color = if mm % 50 == 0 { egui::Color32::from_gray(200) } else if mm % 10 == 0 { egui::Color32::from_gray(220) } else { egui::Color32::from_gray(235) };
+                                ui.painter().line_segment([egui::pos2(inner_rect.left(), y), egui::pos2(inner_rect.right(), y)], egui::Stroke::new(1.0, color));
+                            }
+
+                            // Draw simple rulers (top and left) with mm labels every 50 mm
+                            for mm in (0..=210).step_by(50) {
+                                let x = inner_rect.left() + (mm as f32) * mm_to_ui_x;
+                                ui.painter().text(egui::pos2(x + 2.0, inner_rect.top() - 14.0), egui::Align2::LEFT_TOP, format!("{}mm", mm), egui::FontId::proportional(10.0), egui::Color32::from_gray(120));
+                            }
+                            for mm in (0..=297).step_by(50) {
+                                let y = inner_rect.top() + (mm as f32) * mm_to_ui_y;
+                                ui.painter().text(egui::pos2(inner_rect.left() - 40.0, y - 6.0), egui::Align2::LEFT_TOP, format!("{}mm", mm), egui::FontId::proportional(10.0), egui::Color32::from_gray(120));
+                            }
+
+                            // Overlay configured QR boxes using config coordinates (PDF points -> UI scale).
+                            // PDF points: A4 ~ 595 x 842
+                            let pdf_w = 595.0_f32;
+                            let pdf_h = 842.0_f32;
+                            let scale_x = inner_rect.width() / pdf_w;
+                            let scale_y = inner_rect.height() / pdf_h;
+                            for (i, qr) in self.config.qr_codes.iter().enumerate() {
+                                let qr_ui_x = inner_rect.left() + qr.x as f32 * scale_x;
+                                let qr_ui_y = inner_rect.top() + qr.y as f32 * scale_y;
+                                let size_ui = qr.size as f32 * scale_x;
+                                let qr_rect = egui::Rect::from_min_size(egui::pos2(qr_ui_x, qr_ui_y), egui::vec2(size_ui, size_ui));
+                                ui.painter().rect_stroke(qr_rect, 2.0, egui::Stroke::new(1.5, egui::Color32::from_rgb(120, 160, 220)));
+                                ui.painter().text(egui::pos2(qr_ui_x + 2.0, qr_ui_y + 2.0), egui::Align2::LEFT_TOP, format!("QR{}", i+1), egui::FontId::proportional(10.0), egui::Color32::from_rgb(80,80,80));
+                            }
+                            // Small header area inside the A4 schematic for status text
+                            let header_rect = egui::Rect::from_min_size(
+                                inner_rect.min,
+                                egui::vec2(inner_rect.width(), 60.0)
+                            );
+                            ui.painter().rect_filled(header_rect, 3.0, egui::Color32::from_rgb(245, 245, 250));
+                            ui.painter().rect_stroke(header_rect, 3.0, egui::Stroke::new(1.0, egui::Color32::from_rgb(200, 200, 200)));
+                            ui.painter().text(
+                                egui::pos2(header_rect.left() + 10.0, header_rect.top() + 10.0),
+                                egui::Align2::LEFT_TOP,
+                                &template_status,
+                                egui::FontId::proportional(11.0),
+                                if template_loaded { egui::Color32::from_rgb(0, 120, 0) } else { egui::Color32::from_rgb(200, 100, 0) },
+                            );
                             
-                            // Skalierungsfaktor für die Koordinaten (mm zu UI-Pixel)
-                            let scale_x = 210.0 / a4_width;  // DIN A4: 210 mm breit
-                            let scale_y = 297.0 / a4_height; // DIN A4: 297 mm hoch
+                            // CSV-Status anzeigen
+                            ui.painter().text(
+                                egui::pos2(header_rect.left() + 10.0, header_rect.top() + 25.0),
+                                egui::Align2::LEFT_TOP,
+                                &csv_status,
+                                egui::FontId::proportional(11.0),
+                                if csv_exists { egui::Color32::from_rgb(0, 120, 0) } else { egui::Color32::from_rgb(200, 0, 0) },
+                            );
                             
-                            // QR-Codes - OPTIMIERT
+                            ui.painter().text(
+                                egui::pos2(header_rect.center().x, header_rect.top() + 45.0),
+                                egui::Align2::CENTER_TOP,
+                                &format!("📄 {} {} Vorlage{}", 
+                                        self.selected_group,
+                                        self.selected_language,
+                                        if self.is_messe { " (Messe)" } else { "" }),
+                                egui::FontId::proportional(16.0),
+                                egui::Color32::from_rgb(80, 80, 80),
+                            );
+
+                            // (Full preview control removed to keep UI simple and performant)
+                            
+                            // (Removed simulated customer/order form sections to keep preview minimal and unambiguous)
+                            // Skalierungsfaktor für die Koordinaten (DIN A4 in PDF ist ca. 595x842 Punkte)
+                            let scale_x = 595.0 / a4_width;
+                            let scale_y = 842.0 / a4_height;
+                            
+                            // QR-Codes
                             for (i, qr) in self.config.qr_codes.iter_mut().enumerate() {
-                                let qr_display_size = 25.0; // Feste Größe für Performance
+                                let qr_display_size = qr.size * 1.5; // Größer für bessere Sichtbarkeit
                                 let qr_pos_x = qr.x / scale_x;
-                                let qr_pos_y = a4_height - (qr.y / scale_y);
+                                let qr_pos_y = a4_height - (qr.y / scale_y); // Y-Koordinate umkehren
+                                
+                                // DEBUG: Position für ersten QR-Code anzeigen
+                                if i == 0 {
+                                    ui.painter().text(
+                                        egui::pos2(a4_rect.left(), a4_rect.bottom() + 25.0),
+                                        egui::Align2::LEFT_TOP,
+                                        format!("QR1: x={:.1}, y={:.1} -> UI: x={:.1}, y={:.1}", 
+                                               qr.x, qr.y, qr_pos_x, qr_pos_y),
+                                        egui::FontId::proportional(11.0),
+                                        egui::Color32::from_rgb(100, 100, 100),
+                                    );
+                                }
                                 
                                 let qr_rect = egui::Rect::from_min_size(
                                     egui::pos2(a4_rect.left() + qr_pos_x, a4_rect.top() + qr_pos_y),
                                     egui::vec2(qr_display_size, qr_display_size)
                                 );
                                 
-                                let qr_id = egui::Id::new(format!("qr_{}", i));
+                                // QR-Code mit interact_rect für bessere Drag-Detection
+                                let qr_id = egui::Id::new(format!("qr_code_drag_{}", i));
                                 let qr_response = ui.interact(qr_rect, qr_id, egui::Sense::drag());
                                 
-                                // Einfache Darstellung
-                                ui.painter().rect_filled(qr_rect, 3.0, egui::Color32::from_rgb(255, 165, 0));
+                                // QR-Code visuell darstellen
+                                // If selected, draw a highlighted border
+                                if let Some((ref kind, idx)) = self.selected_element {
+                                    if kind == "qr" && idx == i {
+                                        ui.painter().rect_stroke(qr_rect.expand(4.0), 3.0, egui::Stroke::new(2.0, egui::Color32::from_rgb(40, 160, 40)));
+                                    }
+                                }
+                                ui.painter().rect_filled(qr_rect, 3.0, egui::Color32::from_rgb(255, 165, 0)); // Orange
                                 ui.painter().text(
                                     qr_rect.center(),
                                     egui::Align2::CENTER_CENTER,
-                                    format!("Q{}", i + 1),
-                                    egui::FontId::proportional(10.0),
+                                    format!("📱 Q{}", i + 1),
+                                    egui::FontId::default(),
                                     egui::Color32::BLACK,
                                 );
                                 
                                 if qr_response.dragged() {
                                     let delta = qr_response.drag_delta();
                                     qr.x += delta.x * scale_x;
-                                    qr.y -= delta.y * scale_y;
-                                    qr.x = qr.x.max(0.0).min(210.0 - qr.size); // DIN A4: 210 mm breit
-                                    qr.y = qr.y.max(0.0).min(297.0 - qr.size); // DIN A4: 297 mm hoch
+                                    qr.y -= delta.y * scale_y; // Y-Koordinate umkehren
+                                    // Grenzen prüfen
+                                    qr.x = qr.x.max(0.0).min(595.0 - qr.size);
+                                    qr.y = qr.y.max(0.0).min(842.0 - qr.size);
+                                    
+                                    // Update manual input fields for first QR code
+                                    if i == 0 {
+                                        self.manual_qr_x = format!("{:.1}", qr.x);
+                                        self.manual_qr_y = format!("{:.1}", qr.y);
+                                        self.manual_qr_size = format!("{:.1}", qr.size);
+                                    }
                                 }
-                                
-                                if qr_response.drag_stopped() && i == 0 {
-                                    self.manual_qr_x = format!("{:.1}", qr.x);
-                                    self.manual_qr_y = format!("{:.1}", qr.y);
-                                    self.manual_qr_size = format!("{:.1}", qr.size);
+                                if qr_response.clicked() {
+                                    self.selected_element = Some(("qr".to_string(), i));
                                 }
                             }
                             
-                            // Vertreternummern-Felder - OPTIMIERT
-                            for (i, pos) in self.config.vertreter.iter_mut().enumerate() {
-                                let field_width = 40.0;
-                                let field_height = 12.0;
-                                let field_pos_x = pos.x / scale_x;
-                                let field_pos_y = a4_height - (pos.y / scale_y);
+                            // Draw minimal markers for Vertreternummer positions so users can see and nudge them.
+                            for (i, v) in self.config.vertreter.iter_mut().enumerate() {
+                                // Use the same transform as above (map PDF points -> A4 UI coordinates)
+                                // Compute a rectangular marker that reflects the font size and expected text width.
+                                // Approximate width: character_width_factor * font_size * estimated_chars
+                                let est_chars = v.font_name.len().max(6) as f32; // rough estimate (at least room for number)
+                                let char_width_factor = 0.6; // approximate em-width factor
+                                let text_width_pts = v.font_size * char_width_factor * est_chars; // in PDF pts
+                                // Convert PDF points to UI using same scale_x/scale_y mapping
+                                let marker_w_ui = text_width_pts / scale_x;
+                                let marker_h_ui = (v.font_size * 1.2) / scale_y; // little padding
+                                let v_pos_x = v.x / scale_x;
+                                let v_pos_y = a4_height - (v.y / scale_y); // invert Y like for QR
 
-                                let field_rect = egui::Rect::from_min_size(
-                                    egui::pos2(a4_rect.left() + field_pos_x, a4_rect.top() + field_pos_y),
-                                    egui::vec2(field_width, field_height)
+                                let vert_rect = egui::Rect::from_min_size(
+                                    egui::pos2(a4_rect.left() + v_pos_x, a4_rect.top() + v_pos_y),
+                                    egui::vec2(marker_w_ui.max(12.0), marker_h_ui.max(10.0)),
                                 );
 
-                                let field_id = egui::Id::new(format!("field_{}", i));
-                                let field_response = ui.interact(field_rect, field_id, egui::Sense::drag());
+                                // Small interactable area so the user can drag the vertreter marker
+                                let vert_id = egui::Id::new(format!("vertreter_drag_{}", i));
+                                let vert_resp = ui.interact(vert_rect, vert_id, egui::Sense::drag());
 
-                                // Darstellung als v1, v2, ...
-                                ui.painter().rect_filled(field_rect, 2.0, egui::Color32::LIGHT_BLUE);
-                                ui.painter().text(
-                                    field_rect.center(),
-                                    egui::Align2::CENTER_CENTER,
-                                    format!("v{}", i + 1),
-                                    egui::FontId::proportional(8.0),
-                                    egui::Color32::BLACK,
-                                );
-
-                                if field_response.dragged() {
-                                    let delta = field_response.drag_delta();
-                                    pos.x += delta.x * scale_x;
-                                    pos.y -= delta.y * scale_y;
-                                    pos.x = pos.x.max(0.0).min(210.0 - field_width * scale_x); // DIN A4: 210 mm breit
-                                    pos.y = pos.y.max(0.0).min(297.0 - field_height * scale_y); // DIN A4: 297 mm hoch
+                                // Draw the marker: pale blue rounded rect with a thin border and label
+                                ui.painter().rect_filled(vert_rect, 4.0, egui::Color32::from_rgb(200, 220, 255));
+                                ui.painter().rect_stroke(vert_rect, 4.0, egui::Stroke::new(1.0, egui::Color32::from_rgb(120, 140, 180)));
+                                // Highlight if selected
+                                if let Some((ref kind, idx)) = self.selected_element {
+                                    if kind == "vertreter" && idx == i {
+                                        ui.painter().rect_stroke(vert_rect.expand(4.0), 4.0, egui::Stroke::new(2.0, egui::Color32::from_rgb(40, 160, 40)));
+                                    }
                                 }
-                                
-                                if field_response.drag_stopped() && i == 0 {
-                                    self.manual_vertreter_x = format!("{:.1}", pos.x);
-                                    self.manual_vertreter_y = format!("{:.1}", pos.y);
-                                    self.manual_vertreter_size = format!("{:.1}", pos.size);
+                                ui.painter().text(
+                                    egui::pos2(vert_rect.left() + 4.0, vert_rect.center().y - 6.0),
+                                    egui::Align2::LEFT_CENTER,
+                                    format!("V{} ({})", i + 1, v.font_name),
+                                    egui::FontId::proportional((v.font_size / 1.2).max(10.0)),
+                                    egui::Color32::from_rgb(40, 40, 40),
+                                );
+
+                                if vert_resp.dragged() {
+                                    let delta = vert_resp.drag_delta();
+                                    v.x += delta.x * scale_x;
+                                    v.y -= delta.y * scale_y; // invert Y
+
+                                    // Boundaries (PDF coordinates)
+                                    v.x = v.x.max(0.0).min(595.0 - v.size);
+                                    v.y = v.y.max(0.0).min(842.0 - v.size);
+
+                                    // If first vertreter, update manual input fields for quick feedback
+                                    // No manual text fields for vertreter currently; positions update in config.
+                                }
+                                if vert_resp.clicked() {
+                                    self.selected_element = Some(("vertreter".to_string(), i));
                                 }
                             }
                         });
@@ -2992,61 +3489,39 @@ impl App for MyApp {
                                             // PERFORMANCE: Noch weniger Fonts für flüssige UI
                                             egui::ComboBox::from_id_source(format!("font_combo_{}", i))
                                                 .selected_text(&v.font_name)
-                                                .width(200.0) // Breiter für Suchfeld
+                                                .width(150.0)
                                                 .show_ui(ui, |ui| {
-                                                    // Font-Suchfeld
-                                                    ui.horizontal(|ui| {
-                                                        ui.label("🔍");
-                                                        ui.text_edit_singleline(&mut self.font_search_text);
-                                                        if ui.small_button("❌").clicked() {
-                                                            self.font_search_text.clear();
-                                                        }
-                                                    });
-                                                    ui.separator();
-                                                    
-                                                    let search_text = self.font_search_text.to_lowercase();
-                                                    let is_searching = !search_text.is_empty();
-                                                    
                                                     // PERFORMANCE: Nur die wichtigsten Fonts zeigen
                                                     
                                                     let common_fonts = ["Arial", "Calibri", "Times New Roman", "Helvetica", "Verdana", "Georgia"];
+                                                    let current_font = v.font_name.clone();
                                                     
-                                                    // Häufige Fonts - IMMER sichtbar (außer bei Suche)
-                                                    if !is_searching {
-                                                        ui.label("📌 Häufig:");
-                                                        for font in &common_fonts {
-                                                            ui.selectable_value(&mut v.font_name, font.to_string(), *font);
-                                                        }
+                                                    // Aktueller Font zuerst (falls nicht in common_fonts)
+                                                    if !common_fonts.contains(&current_font.as_str()) {
+                                                        ui.selectable_value(&mut v.font_name, current_font.clone(), current_font);
                                                         ui.separator();
                                                     }
                                                     
-                                                    // Alle anderen Fonts (gefiltert oder alle)
-                                                    let label = if is_searching {
-                                                        format!("🔍 Suchergebnisse:")
-                                                    } else {
-                                                        "🔤 Weitere:".to_string()
-                                                    };
-                                                    ui.label(label);
+                                                    // Häufige Fonts - IMMER sichtbar
+                                                    ui.label("📌 Häufig:");
+                                                    for font in &common_fonts {
+                                                        ui.selectable_value(&mut v.font_name, font.to_string(), *font);
+                                                    }
                                                     
+                                                    ui.separator();
+                                                    
+                                                    // PERFORMANCE: Nur erste 15 andere Fonts für flüssige Performance
+                                                    ui.label("🔤 Weitere:");
                                                     let mut shown_count = 0;
-                                                    let max_to_show = if is_searching || self.show_all_fonts { 
-                                                        self.cached_fonts.len() 
-                                                    } else { 
-                                                        15 
-                                                    };
+                                                    let max_initial = 15; // Stark reduziert für Performance
                                                     
                                                     for font in &self.cached_fonts {
-                                                        // Skip häufige Fonts (außer bei Suche)
-                                                        if !is_searching && common_fonts.contains(&font.as_str()) {
+                                                        // Skip häufige Fonts
+                                                        if common_fonts.contains(&font.as_str()) {
                                                             continue;
                                                         }
                                                         
-                                                        // Filter nach Suchtext
-                                                        if is_searching && !font.to_lowercase().contains(&search_text) {
-                                                            continue;
-                                                        }
-                                                        
-                                                        if shown_count < max_to_show {
+                                                        if shown_count < max_initial {
                                                             ui.selectable_value(&mut v.font_name, font.clone(), font);
                                                             shown_count += 1;
                                                         } else {
@@ -3054,25 +3529,10 @@ impl App for MyApp {
                                                         }
                                                     }
                                                     
-                                                    // Button um alle Fonts zu zeigen/verstecken (nur wenn nicht gesucht wird)
-                                                    if !is_searching {
-                                                        if !self.show_all_fonts && self.cached_fonts.len() > (common_fonts.len() + 15) {
-                                                            ui.horizontal(|ui| {
-                                                                ui.small(format!("📝 +{} weitere", 
-                                                                    self.cached_fonts.len() - common_fonts.len() - 15));
-                                                                if ui.small_button("📋 Alle zeigen").clicked() {
-                                                                    self.show_all_fonts = true;
-                                                                    println!("🔤 Zeige alle {} Schriftarten", self.cached_fonts.len());
-                                                                }
-                                                            });
-                                                        } else if self.show_all_fonts {
-                                                            if ui.small_button("📁 Weniger zeigen").clicked() {
-                                                                self.show_all_fonts = false;
-                                                                println!("🔤 Zeige nur häufige Schriftarten");
-                                                            }
-                                                        }
-                                                    } else if shown_count == 0 {
-                                                        ui.label("❌ Keine Schriftarten gefunden");
+                                                    // Info über weitere verfügbare Fonts
+                                                    if self.cached_fonts.len() > (common_fonts.len() + max_initial) {
+                                                        ui.small(format!("� +{} weitere verfügbar", 
+                                                            self.cached_fonts.len() - common_fonts.len() - max_initial));
                                                     }
                                                 });
                                             
@@ -3106,10 +3566,7 @@ impl App for MyApp {
                                         
                                         ui.horizontal(|ui| {
                                             ui.label("Schriftgröße:");
-                                            ui.add(egui::Slider::new(&mut v.font_size, 4.0..=72.0)
-                                                .suffix(" pt")
-                                                .step_by(0.1)
-                                                .fixed_decimals(1));
+                                            ui.add(egui::Slider::new(&mut v.font_size, 6.0..=48.0).suffix(" pt"));
                                         });
                                         
                                         // Seiten-Auswahl für dieses Vertreternummer-Feld
@@ -3169,7 +3626,7 @@ impl App for MyApp {
                                     } else {
                                         format!("Seiten: {:?}", qr.pages)
                                     };
-                                    ui.label(format!("QR-Code {}: x={:.1}mm, y={:.1}mm, Größe={:.1}mm, {}", 
+                                    ui.label(format!("QR-Code {}: x={:.1}, y={:.1}, Größe={:.1}, {}", 
                                         i + 1, qr.x, qr.y, qr.size, pages_str));
                                 }
                                 for (i, pos) in self.config.vertreter.iter().enumerate() {
@@ -3178,7 +3635,7 @@ impl App for MyApp {
                                     } else {
                                         format!("Seiten: {:?}", pos.pages)
                                     };
-                                    ui.label(format!("Vertreternummer {}: x={:.1}mm, y={:.1}mm, Größe={:.1}, Font: {} {} ({}pt), {}", 
+                                    ui.label(format!("Vertreternummer {}: x={:.1}, y={:.1}, Größe={:.1}, Font: {} {} ({}pt), {}", 
                                         i + 1, pos.x, pos.y, pos.size, pos.font_name, pos.font_style, pos.font_size, pages_str));
                                 }
                             });
@@ -3193,15 +3650,15 @@ impl App for MyApp {
                                     ui.group(|ui| {
                                         ui.label("QR-Code Position (erster QR-Code):");
                                         ui.horizontal(|ui| {
-                                            ui.label("X (mm):");
+                                            ui.label("X:");
                                             ui.text_edit_singleline(&mut self.manual_qr_x);
                                         });
                                         ui.horizontal(|ui| {
-                                            ui.label("Y (mm):");
+                                            ui.label("Y:");
                                             ui.text_edit_singleline(&mut self.manual_qr_y);
                                         });
                                         ui.horizontal(|ui| {
-                                            ui.label("Größe (mm):");
+                                            ui.label("Größe:");
                                             ui.text_edit_singleline(&mut self.manual_qr_size);
                                         });
                                         if ui.button("🔄 QR-Code Position setzen").clicked() {
@@ -3213,7 +3670,7 @@ impl App for MyApp {
                                                 self.config.qr_codes[0].x = x;
                                                 self.config.qr_codes[0].y = y;
                                                 self.config.qr_codes[0].size = size;
-                                                println!("QR-Code Position manuell gesetzt: x={}mm, y={}mm, size={}mm", x, y, size);
+                                                println!("QR-Code Position manuell gesetzt: x={}, y={}, size={}", x, y, size);
                                             }
                                         }
                                     });
@@ -3225,11 +3682,11 @@ impl App for MyApp {
                                     ui.group(|ui| {
                                         ui.label("Kundennummer Position (erste Position):");
                                         ui.horizontal(|ui| {
-                                            ui.label("X (mm):");
+                                            ui.label("X:");
                                             ui.text_edit_singleline(&mut self.manual_vertreter_x);
                                         });
                                         ui.horizontal(|ui| {
-                                            ui.label("Y (mm):");
+                                            ui.label("Y:");
                                             ui.text_edit_singleline(&mut self.manual_vertreter_y);
                                         });
                                         ui.horizontal(|ui| {
@@ -3247,7 +3704,7 @@ impl App for MyApp {
                                                 if let Ok(sz) = self.manual_vertreter_size.parse::<f32>() {
                                                     self.config.vertreter[0].size = sz;
                                                 }
-                                                println!("Kundennummer Position manuell gesetzt: x={}mm, y={}mm", x, y);
+                                                println!("Kundennummer Position manuell gesetzt: x={}, y={}", x, y);
                                             }
                                         }
                                     });
@@ -3260,7 +3717,7 @@ impl App for MyApp {
                             
                             ui.separator();
                             
-                            // Speichern Button
+                            // Speichern/Abbrechen Buttons
                             ui.horizontal(|ui| {
                                 if ui.button("💾 Speichern").clicked() {
                                     println!("=== SPEICHERN GEDRÜCKT ===");
@@ -3283,6 +3740,7 @@ impl App for MyApp {
                                     }
                                     
                                     self.save_message = Some(std::time::Instant::now());
+                                    self.show_config = false;
                                     
                                     // Nach dem Speichern nochmal laden um sicherzustellen dass alles stimmt
                                     let loaded_config = load_group_config(&self.selected_group, &self.selected_language, self.is_messe);
@@ -3290,16 +3748,19 @@ impl App for MyApp {
                                             loaded_config.qr_codes, loaded_config.vertreter);
                                     self.config = loaded_config;
                                     println!("=== SPEICHERN ABGESCHLOSSEN ===");
-                                    
-                                    // Dialog schließen
+                                }
+                                if ui.button("❌ Abbrechen").clicked() {
+                                    println!("=== ABBRECHEN GEDRÜCKT ===");
+                                    // Gruppenspezifische Config komplett neu laden um alle Änderungen zu verwerfen
+                                    self.config = load_group_config(&self.selected_group, &self.selected_language, self.is_messe);
+                                    println!("Abgebrochen - gruppenspezifische Config zurückgesetzt: QR={:?}, Vertreter={:?}", 
+                                            self.config.qr_codes, self.config.vertreter);
                                     self.show_config = false;
                                 }
                             });
                         });
                     });
                 });
-                
-                // WICHTIG: show_config korrekt übernehmen - X-Button schließt Dialog
                 self.show_config = show_config;
             }
             
@@ -3320,11 +3781,11 @@ impl App for MyApp {
 }
 
 fn read_vertreter(file_path: &str) -> Vec<(String, String, String)> {
-    println!("DEBUG: Versuche CSV zu lesen: {}", file_path);
+    debug_print_global(&format!("Versuche CSV zu lesen: {}", file_path));
     
     let content = match fs::read_to_string(file_path) {
         Ok(content) => {
-            println!("DEBUG: CSV erfolgreich gelesen, {} Zeichen", content.len());
+                debug_print_global(&format!("CSV erfolgreich gelesen, {} Zeichen", content.len()));
             content
         },
         Err(e) => {
@@ -3351,8 +3812,8 @@ fn read_vertreter(file_path: &str) -> Vec<(String, String, String)> {
     let mut lines = content.lines();
     
     // Header überspringen (erste Zeile)
-    if let Some(header) = lines.next() {
-        println!("DEBUG: Header übersprungen: {}", header.trim());
+        if let Some(header) = lines.next() {
+        debug_print_global(&format!("Header übersprungen: {}", header.trim()));
     }
 
     lines
@@ -3824,251 +4285,17 @@ fn find_font_file(font_name: &str, style: &str) -> Option<std::path::PathBuf> {
         for name in &possible_names {
             let font_path = std::path::Path::new(&dir).join(name);
             if font_path.exists() && font_path.is_file() {
-                println!("DEBUG: Font gefunden: {} -> {}", font_name, font_path.display());
+                debug_print_global(&format!("Font gefunden: {} -> {}", font_name, font_path.display()));
                 return Some(font_path);
             }
         }
     }
     
-    println!("DEBUG: Font NICHT gefunden: {} ({})", font_name, style);
+    debug_print_global(&format!("Font NICHT gefunden: {} ({})", font_name, style));
     None
 }
 
-
-#[allow(dead_code)]
-fn embed_ttf_font(
-    doc: &mut Document,
-    font_dict: &mut lopdf::Dictionary,
-    font_names: &mut std::collections::HashMap<String, String>,
-    font_counter: &mut usize,
-    font_name: &str,
-    font_path: &std::path::Path,
-    debug_info: &mut Vec<String>
-) -> Option<String> {
-    match std::fs::read(font_path) {
-        Ok(ttf_data) => {
-            debug_info.push(format!("✓ TTF gelesen: {} ({} KB)", font_path.display(), ttf_data.len() / 1024));
-            
-            let ttf_font_key = format!("TTF{}", font_counter);
-            *font_counter += 1;
-            
-            // Font-Stream für TTF-Daten erstellen 
-            let font_stream_obj = doc.add_object(Stream::new(dictionary!{
-                "Length" => ttf_data.len() as i64,
-                "Length1" => ttf_data.len() as i64
-            }, ttf_data.clone()));
-            
-            // TTF-Metriken ermitteln (BBox / Ascent / Descent / CapHeight), skaliert auf 1000 Em
-            // Setze FontBBox für Arial auf korrekten Wert, sonst Standard
-            let (bbox_vec, ascent, descent, cap_height) = if font_name == "Arial" {
-                (vec![-665, -325, 2000, 1006], 905, -210, 728)
-            } else {
-                (vec![0, -200, 1000, 900], 800, -200, 700)
-            };
-
-            // FontDescriptor erstellen mit korrekten Metriken
-            let font_descriptor_obj = doc.add_object(dictionary!{
-                "Type" => "FontDescriptor",
-                "FontName" => format!("{}+{}", ttf_font_key, font_name.replace(" ", "")),
-                // Minimal sinnvolle Flags; detaillierte Bits optional
-                "Flags" => 32,
-                "FontBBox" => Object::Array(bbox_vec.into_iter().map(Object::Integer).collect()),
-                "ItalicAngle" => 0,
-                "Ascent" => ascent,
-                "Descent" => descent,
-                "CapHeight" => cap_height,
-                "StemV" => 80,
-                "FontFile2" => font_stream_obj
-            });
-            
-            // TrueType Font Dictionary
-            font_dict.set(ttf_font_key.as_bytes(), dictionary!{
-                "Type" => "Font",
-                "Subtype" => "TrueType",
-                "BaseFont" => format!("{}+{}", ttf_font_key, font_name.replace(" ", "")),
-                "FontDescriptor" => font_descriptor_obj,
-                "FirstChar" => 32,
-                "LastChar" => 255,
-                "Widths" => Object::Array((32..256).map(|_| Object::Integer(500)).collect())
-            });
-            
-            font_names.insert(ttf_font_key.clone(), ttf_font_key.clone());
-            debug_info.push(format!("✅ TTF eingebettet: {}", font_name));
-            
-            Some(ttf_font_key)
-        }
-        Err(e) => {
-            debug_info.push(format!("❌ TTF lesen fehlgeschlagen: {} - {}", font_path.display(), e));
-            None
-        }
-    }
-}
-
-/// Standard-Font-Fallback-Funktion für process_page_elements
-fn create_standard_font_fallback(
-    font_dict: &mut lopdf::Dictionary,
-    used_font_keys: &mut std::collections::HashMap<String, String>,
-    font_counter: &mut usize,
-    vertreter_config: &VertreterConfig
-) -> String {
-    let pdf_font_name = match vertreter_config.font_name.as_str() {
-        "Times New Roman" | "Times" => {
-            match vertreter_config.font_style.as_str() {
-                "Bold" => "Times-Bold",
-                "Italic" => "Times-Italic",
-                "Bold Italic" | "BoldItalic" => "Times-BoldItalic",
-                _ => "Times-Roman"
-            }
-        },
-        "Courier New" | "Courier" => {
-            match vertreter_config.font_style.as_str() {
-                "Bold" => "Courier-Bold", 
-                "Italic" => "Courier-Oblique",
-                "Bold Italic" | "BoldItalic" => "Courier-BoldOblique",
-                _ => "Courier"
-            }
-        },
-        // Alle anderen (einschließlich Custom Fonts) → Helvetica-Fallback
-        _ => {
-            match vertreter_config.font_style.as_str() {
-                "Bold" => "Helvetica-Bold",
-                "Italic" => "Helvetica-Oblique",
-                "Bold Italic" | "BoldItalic" => "Helvetica-BoldOblique", 
-                _ => "Helvetica"
-            }
-        }
-    };
-
-    // Prüfe ob Font bereits registriert
-    if let Some(existing_key) = used_font_keys.get(pdf_font_name) {
-        existing_key.clone()
-    } else {
-        let new_key = format!("F{}", font_counter);
-        *font_counter += 1;
-
-        // Wenn der Font ein TTF-Fallback ist (z.B. Arial, Calibri, etc.), extrahiere die Metriken
-        let ttf_metrics = match pdf_font_name {
-            "Arial" | "Calibri" | "Times New Roman" | "Times" | "Courier New" | "Courier" => {
-                // Versuche die TTF-Datei zu laden (Pfad ggf. anpassen!)
-                let ttf_path = format!("fonts/{}.ttf", pdf_font_name.replace(" ", ""));
-                if let Ok(ttf_data) = std::fs::read(&ttf_path) {
-                    extract_ttf_metrics_for_pdf_bytes(&ttf_data)
-                } else {
-                    None
-                }
-            }
-            _ => None
-        };
-
-        if let Some((xmin, ymin, xmax, ymax, asc, desc, cap)) = ttf_metrics {
-            // Registriere Font mit FontDescriptor und korrekten Metriken
-            font_dict.set(new_key.as_bytes(), dictionary!{
-                "Type" => "Font",
-                "Subtype" => "TrueType",
-                "BaseFont" => pdf_font_name,
-                "FontDescriptor" => dictionary!{
-                    "Type" => "FontDescriptor",
-                    "FontName" => pdf_font_name,
-                    "FontBBox" => lopdf::Object::Array(vec![xmin, ymin, xmax, ymax].into_iter().map(lopdf::Object::Integer).collect()),
-                    "Ascent" => asc,
-                    "Descent" => desc,
-                    "CapHeight" => cap,
-                    "Flags" => 32,
-                    "ItalicAngle" => 0,
-                    "StemV" => 87
-                }
-            });
-        } else if pdf_font_name == "Arial" {
-            // Immer korrekten BBox für Arial setzen, falls TTF fehlt
-            font_dict.set(new_key.as_bytes(), dictionary!{
-                "Type" => "Font",
-                "Subtype" => "TrueType",
-                "BaseFont" => pdf_font_name,
-                "FontDescriptor" => dictionary!{
-                    "Type" => "FontDescriptor",
-                    "FontName" => pdf_font_name,
-                    "FontBBox" => lopdf::Object::Array(vec![-665, -325, 2000, 1006].into_iter().map(lopdf::Object::Integer).collect()),
-                    "Ascent" => 905,
-                    "Descent" => -210,
-                    "CapHeight" => 728,
-                    "Flags" => 32,
-                    "ItalicAngle" => 0,
-                    "StemV" => 87
-                }
-            });
-        } else {
-            // Standard-Registrierung für PDF-Standardfonts
-            font_dict.set(new_key.as_bytes(), dictionary!{
-                "Type" => "Font",
-                "Subtype" => "Type1", 
-                "BaseFont" => pdf_font_name
-            });
-        }
-
-        used_font_keys.insert(pdf_font_name.to_string(), new_key.clone());
-        new_key
-    }
-}
-
-// --- TTF metric helpers ---
-#[allow(dead_code)]
-fn extract_ttf_metrics_for_pdf_bytes(ttf: &[u8]) -> Option<(i64, i64, i64, i64, i64, i64, i64)> {
-    if ttf.len() < 12 { return None; }
-    let num_tables = be_u16(&ttf[4..6]) as usize;
-    let mut head_off = 0usize;
-    let mut hhea_off = 0usize;
-    let mut os2_off = 0usize;
-    for i in 0..num_tables {
-        let rec = 12 + i*16;
-        if rec + 16 > ttf.len() { return None; }
-        let tag = &ttf[rec..rec+4];
-        let offset = be_u32(&ttf[rec+8..rec+12]) as usize;
-        match tag {
-            b"head" => head_off = offset,
-            b"hhea" => hhea_off = offset,
-            b"OS/2" => os2_off = offset,
-            _ => {}
-        }
-    }
-    if head_off == 0 || hhea_off == 0 { return None; }
-    if head_off + 54 > ttf.len() { return None; }
-    let units_per_em = be_u16(&ttf[head_off+18..head_off+20]) as i64;
-    if units_per_em <= 0 { return None; }
-    let xmin = be_i16(&ttf[head_off+36..head_off+38]) as i64;
-    let ymin = be_i16(&ttf[head_off+38..head_off+40]) as i64;
-    let xmax = be_i16(&ttf[head_off+40..head_off+42]) as i64;
-    let ymax = be_i16(&ttf[head_off+42..head_off+44]) as i64;
-    if hhea_off + 36 > ttf.len() { return None; }
-    let asc = be_i16(&ttf[hhea_off+4..hhea_off+6]) as i64;
-    let desc = be_i16(&ttf[hhea_off+6..hhea_off+8]) as i64;
-    let mut cap = None;
-    if os2_off != 0 {
-        if os2_off + 96 <= ttf.len() {
-            let s_cap = be_i16(&ttf[os2_off+88..os2_off+90]) as i64;
-            cap = Some(s_cap);
-        }
-    }
-    let scale = 1000f64 / units_per_em as f64;
-    let scale_i = |v: i64| -> i64 { (v as f64 * scale).round() as i64 };
-    Some((
-        scale_i(xmin),
-        scale_i(ymin),
-        scale_i(xmax),
-        scale_i(ymax),
-        scale_i(asc),
-        scale_i(desc),
-        scale_i(cap.unwrap_or(asc)),
-    ))
-}
-
-#[inline]
-fn be_u16(b: &[u8]) -> u16 { ((b[0] as u16) << 8) | (b[1] as u16) }
-#[inline]
-fn be_i16(b: &[u8]) -> i16 { be_u16(b) as i16 }
-#[inline]
-fn be_u32(b: &[u8]) -> u32 { ((b[0] as u32) << 24) | ((b[1] as u32) << 16) | ((b[2] as u32) << 8) | (b[3] as u32) }
-
-fn modify_pdf_with_debug(template_path: &str, kundennr: &str, qr_code: &[u8], qr_width: usize, config: &Config, output_path: &std::path::Path, debug_enabled: bool, enable_font_fallback: bool) {
+fn modify_pdf_with_debug(template_path: &str, kundennr: &str, qr_code: &[u8], qr_width: usize, config: &Config, output_path: &std::path::Path, debug_enabled: bool) {
     debug_print(&format!("Lade PDF-Template: {}", template_path), debug_enabled);
     let mut doc = match Document::load(template_path) {
         Ok(document) => {
@@ -4098,98 +4325,6 @@ fn modify_pdf_with_debug(template_path: &str, kundennr: &str, qr_code: &[u8], qr
         maybe_image_id = Some(image_id);
     }
 
-    // ✅ GLOBALE TTF-FONT-EINBETTUNG (einmalig für gesamtes PDF)
-    let mut global_font_registry = std::collections::HashMap::new();
-    let mut font_counter = 1;
-    
-    for vertreter_config in &config.vertreter {
-        let font_key = format!("{}_{}", vertreter_config.font_name, vertreter_config.font_style);
-        
-        if !global_font_registry.contains_key(&font_key) {
-            if let Some(ttf_path) = find_font_file(&vertreter_config.font_name, &vertreter_config.font_style) {
-                debug_print(&format!("✓ TTF Font einbettend: {} ({}) -> {}", 
-                    vertreter_config.font_name, vertreter_config.font_style, ttf_path.display()), debug_enabled);
-                
-                match std::fs::read(&ttf_path) {
-                    Ok(ttf_data) => {
-                        let ttf_font_key = format!("TTF{}", font_counter);
-                        font_counter += 1;
-                        
-                        // Font-Stream für TTF-Daten erstellen 
-                        let font_stream_obj = doc.add_object(Stream::new(dictionary!{
-                            "Length" => ttf_data.len() as i64,
-                            "Length1" => ttf_data.len() as i64
-                        }, ttf_data));
-                        
-                        // FontDescriptor erstellen - korrekte BBox für verschiedene Fonts
-                        let (font_bbox, flags, italic_angle, ascent, descent, cap_height, stem_v) = match vertreter_config.font_name.as_str() {
-                            "Arial" => (
-                                vec![-665, -325, 2000, 1006], // Korrekte Arial BBox
-                                32,  // Symbolic
-                                0,   // ItalicAngle
-                                905, // Ascent
-                                -210, // Descent
-                                728,  // CapHeight
-                                87    // StemV
-                            ),
-                            "Calibri" => (
-                                vec![-503, -313, 1240, 1089],
-                                32, 0, 952, -269, 632, 87
-                            ),
-                            "Times New Roman" | "Times" => (
-                                vec![-568, -307, 2000, 1007],
-                                34, 0, 891, -216, 662, 93
-                            ),
-                            "Courier New" | "Courier" => (
-                                vec![-122, -680, 623, 1021],
-                                35, 0, 832, -300, 571, 51
-                            ),
-                            _ => (
-                                vec![-665, -325, 2000, 1006], // Default Arial BBox
-                                32, 0, 905, -210, 728, 87
-                            )
-                        };
-                        
-                        let _font_descriptor_obj = doc.add_object(dictionary!{
-                            "Type" => "FontDescriptor",
-                            "FontName" => format!("{}+{}", ttf_font_key, vertreter_config.font_name.replace(" ", "")),
-                            "Flags" => flags,
-                            "FontBBox" => Object::Array(font_bbox.into_iter().map(Object::Integer).collect()),
-                            "ItalicAngle" => italic_angle,
-                            "Ascent" => ascent,
-                            "Descent" => descent,
-                            "CapHeight" => cap_height,
-                            "StemV" => stem_v,
-                            "FontFile2" => font_stream_obj
-                        });
-                        
-                        // TrueType Font Dictionary erstellen und direkt in globaler Font-Dict registrieren
-                        // Aber das geht nicht, weil wir noch nicht in process_page_elements sind
-                        // Registriere erstmal nur den Schlüssel
-                        global_font_registry.insert(font_key.clone(), ttf_font_key.clone());
-                        debug_print(&format!("✅ TTF eingebettet: {} -> {}", vertreter_config.font_name, ttf_font_key), debug_enabled);
-                    }
-                    Err(e) => {
-                        debug_print(&format!("❌ TTF laden fehlgeschlagen: {} - {}, verwende Standard-Font", ttf_path.display(), e), debug_enabled);
-                        // Standard-Font als Fallback registrieren
-                        let standard_key = format!("STD{}", font_counter);
-                        font_counter += 1;
-                        global_font_registry.insert(font_key.clone(), standard_key);
-                    }
-                }
-            } else {
-                debug_print(&format!("⚠ TTF Font NICHT gefunden: {} ({}), verwende Standard-Font", 
-                    vertreter_config.font_name, vertreter_config.font_style), debug_enabled);
-                // Standard-Font als Fallback registrieren
-                let standard_key = format!("STD{}", font_counter);
-                font_counter += 1;
-                global_font_registry.insert(font_key.clone(), standard_key);
-            }
-        }
-    }
-
-    debug_print(&format!("Font-Registry erstellt: {} Fonts eingebettet", global_font_registry.len()), debug_enabled);
-
     // Alle Seiten des PDFs ermitteln
     let all_pages: Vec<u32> = doc.get_pages().keys().cloned().collect();
     debug_print(&format!("PDF hat {} Seiten: {:?}", all_pages.len(), all_pages), debug_enabled);
@@ -4214,11 +4349,12 @@ fn modify_pdf_with_debug(template_path: &str, kundennr: &str, qr_code: &[u8], qr
                 page_number, qr_codes_for_page.len(), vertreter_for_page.len()), debug_enabled);
                 
             process_page_elements(&mut doc, page_id, page_number, &qr_codes_for_page, &vertreter_for_page, 
-                                  kundennr, maybe_image_id, debug_enabled, &global_font_registry, enable_font_fallback);
+                                  kundennr, maybe_image_id, debug_enabled);
         } else {
             debug_print(&format!("Seite {} übersprungen - keine Elemente zu platzieren", page_number), debug_enabled);
         }
     }
+    
     // Sicherstellen dass der Output-Ordner existiert
     if let Some(parent) = output_path.parent() {
         if !parent.exists() {
@@ -4246,25 +4382,18 @@ fn modify_pdf_with_debug(template_path: &str, kundennr: &str, qr_code: &[u8], qr
 
 fn process_page_elements(doc: &mut Document, page_id: lopdf::ObjectId, _page_number: u32,
                          qr_codes: &[&QrCodeConfig], vertreter_configs: &[&VertreterConfig], 
-                         kundennr: &str, maybe_image_id: Option<lopdf::ObjectId>, _debug_enabled: bool,
-                         global_font_registry: &std::collections::HashMap<String, String>,
-                         enable_font_fallback: bool) {
+                         kundennr: &str, maybe_image_id: Option<lopdf::ObjectId>, _debug_enabled: bool) {
     
     let content_stream = doc.get_page_content(page_id).expect("Konnte Seiteninhalt nicht laden");
     let mut content = Content::decode(&content_stream).expect("Konnte Inhalt nicht dekodieren");
 
-    // Alle QR-Codes platzieren (Koordinaten von mm zu PDF-Punkten umrechnen)
+    // Alle QR-Codes platzieren
     for (i, qr_config) in qr_codes.iter().enumerate() {
         if let Some(_img_id) = maybe_image_id {
-            // Umrechnung: mm → PDF-Punkte (1 mm = 2.834646 Punkte)
-            let x_points = qr_config.x * 2.834646;
-            let y_points = qr_config.y * 2.834646;
-            let size_points = qr_config.size * 2.834646;
-            
             content.operations.push(Operation::new("q", vec![]));
             content.operations.push(Operation::new("cm", vec![
-                size_points.into(), 0.into(), 0.into(), size_points.into(), 
-                x_points.into(), y_points.into()
+                qr_config.size.into(), 0.into(), 0.into(), qr_config.size.into(), 
+                qr_config.x.into(), qr_config.y.into()
             ]));
             content.operations.push(Operation::new("Do", vec![Object::Name(format!("Im{}", i + 1).into_bytes())]));
             content.operations.push(Operation::new("Q", vec![]));
@@ -4304,59 +4433,166 @@ fn process_page_elements(doc: &mut Document, page_id: lopdf::ObjectId, _page_num
         let fonts = resources_dict.get_mut(b"Font").expect("Konnte Font nicht finden/anlegen");
         let font_dict = fonts.as_dict_mut().expect("Konnte Font nicht als Dict lesen");
         
-        // VEREINFACHTE FONT-REGISTRIERUNG
-        let mut used_font_keys: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+        // Verschiedene Standard-Fonts definieren
         let mut font_counter = 1;
+        let mut font_names = std::collections::HashMap::new();
         
-        // Jetzt den Content-Stream mit Text schreiben - verwende GLOBALE Font-Registry
         for vertreter_config in vertreter_configs {
-            let font_lookup_key = format!("{}_{}", vertreter_config.font_name, vertreter_config.font_style);
-            
-            // SCHRITT 1: Prüfe ob Custom Font bereits in globaler Registry vorhanden
-            let font_key = if let Some(registered_font_key) = global_font_registry.get(&font_lookup_key) {
-                // Custom Font ist bereits als TTF eingebettet - registriere es in Font-Dict
-                if !used_font_keys.contains_key(registered_font_key) {
-                    // TTF Font Dictionary registrieren (Font wurde bereits eingebettet, nur Dictionary fehlt noch)
-                    font_dict.set(registered_font_key.as_bytes(), dictionary!{
-                        "Type" => "Font",
-                        "Subtype" => "TrueType",
-                        "BaseFont" => format!("{}+{}", registered_font_key, vertreter_config.font_name.replace(" ", "")),
-                        // FontDescriptor und andere Eigenschaften wurden bereits in modify_pdf_with_debug gesetzt
-                        "FirstChar" => 32,
-                        "LastChar" => 255,
-                        "Widths" => Object::Array((32..256).map(|_| Object::Integer(500)).collect())
-                    });
-                    
-                    used_font_keys.insert(registered_font_key.clone(), registered_font_key.clone());
-                    
-                    if _debug_enabled {
-                        println!("✓ Custom TTF Font-Dict registriert: {} -> {}", vertreter_config.font_name, registered_font_key);
+            // Erweiterte Font-Erkennung für mehr Schriftarten (inkl. Source Fonts)
+            let base_font = match vertreter_config.font_name.as_str() {
+                // Times Familie
+                "Times New Roman" | "Times" => "Times",
+                // Arial/Helvetica Familie
+                "Arial" | "Helvetica" => "Helvetica", 
+                // Courier Familie
+                "Courier New" | "Courier" => "Courier",
+                // Adobe/Source Fonts (falls installiert, fallback auf Helvetica)
+                name if name.contains("Adobe") || name.contains("Myriad") || name.contains("Minion") || name.contains("Source") => "Helvetica",
+                // Candara (fallback auf Helvetica)
+                "Candara" => "Helvetica",
+                // Calibri (fallback auf Helvetica)
+                "Calibri" => "Helvetica", 
+                // Weitere Windows-Fonts (fallback auf Helvetica)
+                "Verdana" | "Georgia" | "Trebuchet MS" | "Comic Sans MS" | "Impact" | "Lucida Console" | "Tahoma" => "Helvetica",
+                // Font-Namen mit Styles (extrahiere Basis-Font)
+                name if name.contains("Bold") || name.contains("Italic") || name.contains("Light") || name.contains("Medium") => {
+                    if name.contains("Times") {
+                        "Times"
+                    } else if name.contains("Arial") {
+                        "Helvetica"
+                    } else if name.contains("Courier") {
+                        "Courier"
+                    } else {
+                        "Helvetica"
                     }
-                }
-                registered_font_key.clone()
-            } else if enable_font_fallback {
-                // SCHRITT 2: Standard-Font-Fallback (nur wenn aktiviert)
-                if _debug_enabled {
-                    println!("⚠ Custom Font nicht in Registry: {} ({}), verwende Standard-Font-Fallback", 
-                        vertreter_config.font_name, vertreter_config.font_style);
-                }
-                create_standard_font_fallback(font_dict, &mut used_font_keys, &mut font_counter, vertreter_config)
-            } else {
-                // SCHRITT 3: Kein Fallback - Font übersprungen
-                if _debug_enabled {
-                    println!("❌ Custom Font nicht verfügbar: {} ({}) - Fallback deaktiviert, Element übersprungen", 
-                        vertreter_config.font_name, vertreter_config.font_style);
-                }
-                continue; // Überspringt dieses Text-Element
+                },
+                _ => "Helvetica" // Sicherer Fallback
             };
             
-            // Umrechnung: mm → PDF-Punkte (1 mm = 2.834646 Punkte)
-            let x_points = vertreter_config.x * 2.834646;
-            let y_points = vertreter_config.y * 2.834646;
+            // Erweiterte Style-Zuordnung
+            let pdf_font_name = match (base_font, vertreter_config.font_style.as_str()) {
+                // Times Familie
+                ("Times", "Bold") => "Times-Bold",
+                ("Times", "Italic") => "Times-Italic", 
+                ("Times", "Bold Italic") | ("Times", "BoldItalic") => "Times-BoldItalic",
+                ("Times", _) => "Times-Roman",
+                // Helvetica Familie (Arial → Helvetica Mapping)
+                ("Helvetica", "Bold") => "Helvetica-Bold",
+                ("Helvetica", "Italic") => "Helvetica-Oblique",
+                ("Helvetica", "Bold Italic") | ("Helvetica", "BoldItalic") => "Helvetica-BoldOblique", 
+                ("Helvetica", "Light") => "Helvetica", // Light nicht verfügbar, fallback
+                ("Helvetica", "Medium") => "Helvetica-Bold", // Medium → Bold mapping
+                ("Helvetica", "Heavy") | ("Helvetica", "Black") => "Helvetica-Bold", // Heavy/Black → Bold mapping
+                ("Helvetica", "Thin") => "Helvetica", // Thin nicht verfügbar, fallback
+                ("Helvetica", _) => "Helvetica",
+                // Courier Familie
+                ("Courier", "Bold") => "Courier-Bold",
+                ("Courier", "Italic") => "Courier-Oblique",
+                ("Courier", "Bold Italic") | ("Courier", "BoldItalic") => "Courier-BoldOblique",
+                ("Courier", _) => "Courier",
+                // Sicherer Fallback
+                (_, _) => "Helvetica"
+            };
+            
+            let font_key = format!("F{}", font_counter);
+            if !font_names.contains_key(pdf_font_name) {
+                font_dict.set(font_key.as_bytes(), dictionary!{
+                    "Type" => "Font",
+                    "Subtype" => "Type1",
+                    "BaseFont" => pdf_font_name
+                });
+                font_names.insert(pdf_font_name, font_key.clone());
+                font_counter += 1;
+            }
+        }
+
+        // Jetzt den Content-Stream mit Text schreiben
+        for vertreter_config in vertreter_configs {
+            // NEUE LOGIK: Erst Custom TTF-Font versuchen, dann Fallback auf Standard-PDF-Fonts
+            
+            if let Some(font_path) = find_font_file(&vertreter_config.font_name, &vertreter_config.font_style) {
+                debug_print(&format!("Custom Font gefunden: {} -> {}", vertreter_config.font_name, font_path.display()), _debug_enabled);
+                
+                // Versuche TTF-Font zu laden und in PDF einzubetten
+                if let Ok(font_data) = std::fs::read(&font_path) {
+                    let _custom_font_name = format!("CustomFont_{}_{}", 
+                        vertreter_config.font_name.replace(" ", ""), 
+                        vertreter_config.font_style.replace(" ", ""));
+                    
+                    // TODO: TTF-Font-Einbettung (kompliziert in lopdf)
+                    // Für jetzt: Besseres Standard-Font-Mapping
+                    debug_print(&format!("TTF-Font-Daten geladen ({}kb), verwende verbessertes Mapping", font_data.len() / 1024), _debug_enabled);
+                } else {
+                    debug_print(&format!("Konnte TTF-Font-Datei nicht lesen: {}", font_path.display()), _debug_enabled);
+                }
+            } else {
+                debug_print(&format!("Custom Font NICHT gefunden: {} ({}), verwende Standard-PDF-Font", 
+                    vertreter_config.font_name, vertreter_config.font_style), _debug_enabled);
+            }
+            
+            // 2. Fallback: Verbessertes Standard-PDF-Font-Mapping
+            let base_font = match vertreter_config.font_name.as_str() {
+                // Times Familie - BESSERE ERKENNUNG
+                "Times New Roman" | "Times" | "TimesNewRoman" => "Times",
+                // Arial/Helvetica Familie - BESSERE ERKENNUNG  
+                "Arial" | "Helvetica" | "Arial Unicode MS" => "Helvetica",
+                // Courier Familie
+                "Courier New" | "Courier" | "CourierNew" => "Courier",
+                // Calibri -> Helvetica (ähnlichster Standard-Font)
+                "Calibri" => "Helvetica",
+                // Verdana -> Helvetica 
+                "Verdana" => "Helvetica",
+                // Georgia -> Times (Serif-Font)
+                "Georgia" => "Times",
+                // Adobe/Source Fonts -> Helvetica
+                name if name.contains("Adobe") || name.contains("Myriad") || name.contains("Minion") || name.contains("Source") => "Helvetica",
+                // Weitere Windows-Fonts
+                "Trebuchet MS" | "Comic Sans MS" | "Impact" | "Lucida Console" | "Tahoma" | "Candara" => "Helvetica",
+                // Font-Namen mit Styles (extrahiere Basis-Font)
+                name if name.contains("Bold") || name.contains("Italic") || name.contains("Light") || name.contains("Medium") => {
+                    if name.contains("Times") {
+                        "Times"
+                    } else if name.contains("Arial") {
+                        "Helvetica"
+                    } else if name.contains("Courier") {
+                        "Courier"
+                    } else {
+                        "Helvetica"
+                    }
+                },
+                _ => "Helvetica" // Sicherer Fallback
+            };
+            
+            // Erweiterte Style-Zuordnung (identisch mit oben)
+            let pdf_font_name = match (base_font, vertreter_config.font_style.as_str()) {
+                // Times Familie
+                ("Times", "Bold") => "Times-Bold",
+                ("Times", "Italic") => "Times-Italic", 
+                ("Times", "Bold Italic") | ("Times", "BoldItalic") => "Times-BoldItalic",
+                ("Times", _) => "Times-Roman",
+                // Helvetica Familie (Arial → Helvetica Mapping)
+                ("Helvetica", "Bold") => "Helvetica-Bold",
+                ("Helvetica", "Italic") => "Helvetica-Oblique",
+                ("Helvetica", "Bold Italic") | ("Helvetica", "BoldItalic") => "Helvetica-BoldOblique", 
+                ("Helvetica", "Light") => "Helvetica", // Light nicht verfügbar, fallback
+                ("Helvetica", "Medium") => "Helvetica-Bold", // Medium → Bold mapping
+                ("Helvetica", "Heavy") | ("Helvetica", "Black") => "Helvetica-Bold", // Heavy/Black → Bold mapping
+                ("Helvetica", "Thin") => "Helvetica", // Thin nicht verfügbar, fallback
+                ("Helvetica", _) => "Helvetica",
+                // Courier Familie
+                ("Courier", "Bold") => "Courier-Bold",
+                ("Courier", "Italic") => "Courier-Oblique",
+                ("Courier", "Bold Italic") | ("Courier", "BoldItalic") => "Courier-BoldOblique",
+                ("Courier", _) => "Courier",
+                // Sicherer Fallback
+                (_, _) => "Helvetica"
+            };
+            
+            let font_key = font_names.get(pdf_font_name).unwrap_or(&"F1".to_string()).clone();
             
             content.operations.push(Operation::new("BT", vec![]));
             content.operations.push(Operation::new("Tf", vec![Object::Name(font_key.into_bytes()), vertreter_config.font_size.into()]));
-            content.operations.push(Operation::new("Td", vec![x_points.into(), y_points.into()]));
+            content.operations.push(Operation::new("Td", vec![vertreter_config.x.into(), vertreter_config.y.into()]));
             content.operations.push(Operation::new("Tj", vec![Object::string_literal(kundennr)]));
             content.operations.push(Operation::new("ET", vec![]));
         }
@@ -4389,12 +4625,10 @@ fn generate_bestellscheine_resume(
     use_range: bool,
     range_start: usize,
     range_end: usize,
-    // Font-Fallback Parameter
-    enable_font_fallback: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     // Debug-Logging für Funktion
     if debug_mode {
-        println!("DEBUG: generate_bestellscheine_resume gestartet mit {} Threads, Sleep: {}ms", threads, thread_sleep_ms);
+    debug_print_global(&format!("generate_bestellscheine_resume gestartet mit {} Threads, Sleep: {}ms", threads, thread_sleep_ms));
     }
     
     let stop_signal = Arc::clone(&stop_signal);
@@ -4451,10 +4685,10 @@ fn generate_bestellscheine_resume(
                 
                 // Wähle die richtige URL basierend auf der Sprache
                 let link = if language == "Englisch" || language.to_lowercase().contains("en") {
-                    println!("DEBUG: Verwende englische URL für Vertreter {}: {}", kundennr, en_link);
+                    debug_print_global(&format!("Verwende englische URL für Vertreter {}: {}", kundennr, en_link));
                     en_link
                 } else {
-                    println!("DEBUG: Verwende deutsche URL für Vertreter {}: {}", kundennr, de_link);
+                    debug_print_global(&format!("Verwende deutsche URL für Vertreter {}: {}", kundennr, de_link));
                     de_link
                 };
                 
@@ -4468,14 +4702,17 @@ fn generate_bestellscheine_resume(
                 let (template_group, _template_language, template_is_messe) = infer_group_lang_from_template(&first_template);
                 let group_output_dir = get_configured_output_dir_with_debug(use_custom_output, &custom_output_path, &template_group, &language, template_is_messe, debug_mode);
                 
-                println!("DEBUG: Output-Verzeichnis für Sprache '{}': {}", language, group_output_dir.display());
+                debug_print_global(&format!("Output-Verzeichnis für Sprache '{}': {}", language, group_output_dir.display()));
                 
                 // Prüfen ob PDF bereits existiert
-                let pdf_filename = format!("{}-{}.pdf", 
+                // Versuche, eine Sprache zu detektieren basierend auf Auswahl/template (für Existenz-Check)
+                let detected_for_check = detect_language_code(&language, Some(&first_template), None);
+                let pdf_filename = format!("{}-{}-{}.pdf", 
                     std::path::Path::new(&first_template)
                         .file_stem()
                         .unwrap_or_default()
                         .to_string_lossy(),
+                    detected_for_check,
                     kundennr.replace("\0", "")
                 );
                 let pdf_path = group_output_dir.join(&pdf_filename);
@@ -4484,8 +4721,11 @@ fn generate_bestellscheine_resume(
                     println!("Erstelle PDF für Vertreter {}: {} -> {}/{}", i + 1, kundennr, group, language);
                     // Für jede ausgewählte Template-Option erstellen (aber keine Duplikate)
                     let selections = get_current_selections().unwrap_or_else(|| vec![ ("DATA/Vertreternummern.csv".to_string(), "VORLAGE/Bestellschein-Endkunde-de_de.pdf".to_string(), true) ]);
+                    // Debug: Liste der verwendeten Selections ausgeben, damit wir nachvollziehen können,
+                    // ob die UI-Auswahl oder der Fallback verwendet wird.
+                    debug_print_global(&format!("selections for generation (count={}): {:?}", selections.len(), selections));
                     let mut created = Vec::new();
-                    for (_csv_s, template_s, gen_qr) in selections.iter() {
+                    for (csv_s, template_s, gen_qr) in selections.iter() {
                         // Verhindere doppelte Ausgaben für dieselbe template/kundennr
                         let out_name = format!("{}-{}", template_s, kundennr);
                         if created.contains(&out_name) { continue; }
@@ -4494,19 +4734,29 @@ fn generate_bestellscheine_resume(
                         // Template-Pfad korrekt auflösen
                         let resolved_template = resolve_template_path_with_debug(template_s, debug_mode);
                         let resolved_template_str = resolved_template.to_string_lossy();
-                        
+
                         debug_print(&format!("Verwende Template: {}", resolved_template_str), debug_mode);
-                        
+
+                        // Debug: Zeige welches template_s wir versuchen zu verwenden und ob die Datei existiert
+                        debug_print_global(&format!("template_s='{}' -> resolved='{}' (exists={})", template_s, resolved_template_str, resolved_template.exists()));
+
                         // Prüfe ob Template existiert
                         if !resolved_template.exists() {
                             println!("ERROR: Template-Datei nicht gefunden: {}", resolved_template_str);
                             continue;
                         }
 
-                        // Load per-template/group config (best effort)
+                        // Bestimme kanonischen Sprachcode (de_de / en_us) anhand Template, CSV oder UI
+                        let detected_lang_code = detect_language_code(&language, Some(&resolved_template_str), Some(csv_s));
                         let (group_name, _template_lang, tpl_is_messe) = infer_group_lang_from_template(&resolved_template_str);
-                        
-                        // Verwende aktuelle UI-Config falls verfügbar, sonst fallback zu group config
+
+                        // Debug: Zeige den detektierten Sprachcode und den Pfad, wohin geschrieben werden soll
+                        let tpl_stem = resolved_template.file_stem().unwrap_or_default().to_string_lossy();
+                        let output_filename_preview = format!("{}-{}.pdf", tpl_stem, kundennr);
+                        let output_path_preview = get_configured_output_dir_with_debug(use_custom_output, &custom_output_path, &group_name, &detected_lang_code, tpl_is_messe, debug_mode).join(&output_filename_preview);
+                        debug_print_global(&format!("detected_lang_code='{}', preview_output_path='{}'", detected_lang_code, output_path_preview.display()));
+
+                        // Verwende aktuelle UI-Config falls verfügbar, sonst fallback zu group config (mit detektiertem Sprachcode)
                         let tpl_config = {
                             let _lock = CONFIG_MUTEX.lock().unwrap();
                             unsafe {
@@ -4514,26 +4764,24 @@ fn generate_bestellscheine_resume(
                                     println!("🎯 Verwende aktuelle UI-Config für PDF-Generierung: QR={:?}", current_config.qr_codes);
                                     current_config.clone()
                                 } else {
-                                    println!("⚠️ Keine UI-Config verfügbar, lade Group-Config");
-                                    load_group_config(&group_name, &language, tpl_is_messe)
+                                    println!("⚠️ Keine UI-Config verfügbar, lade Group-Config (detected lang: {})", detected_lang_code);
+                                    load_group_config(&group_name, &detected_lang_code, tpl_is_messe)
                                 }
                             }
                         };
                         if *gen_qr {
                             let (qr_img, qr_width) = generate_qr(link);
-                            let output_filename = format!("{}-{}.pdf", 
-                                resolved_template.file_stem().unwrap_or_default().to_string_lossy(),
-                                kundennr
-                            );
-                            let output_path = get_configured_output_dir_with_debug(use_custom_output, &custom_output_path, &group_name, &language, tpl_is_messe, debug_mode).join(&output_filename);
-                            modify_pdf_with_debug(&resolved_template_str, kundennr, &qr_img, qr_width, &tpl_config, &output_path, debug_mode, enable_font_fallback);
+                            // Output-Dateiname jetzt inklusive Sprachcode
+                            let tpl_stem = resolved_template.file_stem().unwrap_or_default().to_string_lossy();
+                            // Verwende nur Template-Stem + Kundennr als Dateiname
+                            let output_filename = format!("{}-{}.pdf", tpl_stem, kundennr);
+                            let output_path = get_configured_output_dir_with_debug(use_custom_output, &custom_output_path, &group_name, &detected_lang_code, tpl_is_messe, debug_mode).join(&output_filename);
+                            modify_pdf_with_debug(&resolved_template_str, kundennr, &qr_img, qr_width, &tpl_config, &output_path, debug_mode);
                         } else {
-                            let output_filename = format!("{}-{}.pdf", 
-                                resolved_template.file_stem().unwrap_or_default().to_string_lossy(),
-                                kundennr
-                            );
-                            let output_path = get_configured_output_dir_with_debug(use_custom_output, &custom_output_path, &group_name, &language, tpl_is_messe, debug_mode).join(&output_filename);
-                            modify_pdf_with_debug(&resolved_template_str, kundennr, &[], 0, &tpl_config, &output_path, debug_mode, enable_font_fallback);
+                            let tpl_stem = resolved_template.file_stem().unwrap_or_default().to_string_lossy();
+                            let output_filename = format!("{}-{}.pdf", tpl_stem, kundennr);
+                            let output_path = get_configured_output_dir_with_debug(use_custom_output, &custom_output_path, &group_name, &detected_lang_code, tpl_is_messe, debug_mode).join(&output_filename);
+                            modify_pdf_with_debug(&resolved_template_str, kundennr, &[], 0, &tpl_config, &output_path, debug_mode);
                         }
                     }
                 } else {
@@ -4583,7 +4831,7 @@ fn generate_bestellscheine_resume(
         // Progress-Datei löschen für nächsten Durchlauf
         if let Err(e) = std::fs::remove_file(&progress_path) {
             // Fehler nur bei Debug ausgeben, da es nicht kritisch ist
-            eprintln!("DEBUG: Konnte progress.txt nicht löschen: {}", e);
+            debug_print_global(&format!("Konnte progress.txt nicht löschen: {}", e));
         }
     }
 
