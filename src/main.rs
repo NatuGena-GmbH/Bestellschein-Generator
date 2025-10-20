@@ -4,7 +4,6 @@
 use eframe::egui;
 use eframe::App;
 use std::sync::{Arc, Mutex};
-use once_cell::sync::Lazy;
 use std::thread;
 use std::fs;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -849,7 +848,18 @@ fn save_group_config(group: &str, language: &str, is_messe: bool, config: &Confi
     }
     toml.push_str("]\n\n");
     
-    // Datei schreiben
+    // If we have a previously loaded config path, prefer saving back to it
+    if let Some(p) = get_current_config_path() {
+        if let Err(e) = std::fs::write(&p, toml.clone()) {
+            eprintln!("Konnte gruppenspezifische Config nicht in geladenem Pfad {:?} speichern: {}", p, e);
+        } else {
+            println!("✅ Gruppenspezifische Config gespeichert (geladene Datei): {:?}", p);
+            println!("Config-Werte: QR={:?}, Vertreter={:?}", config.qr_codes, config.vertreter);
+            return;
+        }
+    }
+
+    // Fallback: write to default group filename
     if let Err(e) = std::fs::write(&group_filename, toml) {
         eprintln!("Konnte gruppenspezifische Config nicht speichern: {}", e);
     } else {
@@ -857,6 +867,24 @@ fn save_group_config(group: &str, language: &str, is_messe: bool, config: &Confi
         println!("Config-Werte: QR={:?}, Vertreter={:?}", 
                  config.qr_codes, config.vertreter);
     }
+}
+
+// Helper to explicitly save to a path (used by UI when user chooses "In Datei speichern")
+fn save_group_config_to_path(path: &std::path::Path, config: &Config) -> Result<(), std::io::Error> {
+    let mut toml = String::new();
+    toml.push_str("# Manuell gespeicherte Config\n");
+    toml.push_str("qr_codes = [\n");
+    for qr in &config.qr_codes {
+        toml.push_str(&format!("  {{ x = {}, y = {}, size = {}, all_pages = {} }},\n", qr.x, qr.y, qr.size, qr.all_pages));
+    }
+    toml.push_str("]\n\n");
+    toml.push_str("[positions]\n");
+    toml.push_str("vertreter_nummer = [\n");
+    for v in &config.vertreter {
+        toml.push_str(&format!("  {{ x = {}, y = {}, size = {}, all_pages = {}, font_name = \"{}\", font_size = {}, font_style = \"{}\" }},\n", v.x, v.y, v.size, v.all_pages, v.font_name, v.font_size, v.font_style));
+    }
+    toml.push_str("]\n");
+    std::fs::write(path, toml)
 }
 
 // Resume-Funktionalität: Prüfen ob bereits PDFs erstellt wurden
@@ -965,6 +993,9 @@ pub struct MyApp {
     resume_info: Option<(usize, usize, u64)>, // (current_index, total_count, elapsed_seconds)
     // Selected element in the preview: kind ("qr"/"vertreter") and index
     selected_element: Option<(String, usize)>,
+    // UI helpers for saving config
+    config_save_path: String,
+    show_save_as: bool,
     // Full PDF preview state (removed - kept preview lightweight)
 }
 
@@ -1086,6 +1117,8 @@ impl Default for MyApp {
             // Resume-Information (gruppenspezifisch beim Start geladen)
             resume_info: initial_resume_info,
             selected_element: None,
+            config_save_path: String::new(),
+            show_save_as: false,
             // preview state removed
         }
     }
@@ -1443,6 +1476,27 @@ fn get_preferred_language_codes(request: &str) -> Vec<String> {
     }
 }
 
+// Liefert mögliche Varianten eines Sprachkürzels, z.B. für "Deutsch" -> ["de_de","de","DE"]
+fn get_language_code_variants(lang: &str) -> Vec<String> {
+    let r = lang.to_lowercase();
+    if r.contains("en") || r.contains("engl") || r.contains("english") {
+        vec!["en_us".to_string(), "en".to_string(), "EN".to_string()]
+    } else if r.contains("fr") || r.contains("franz") || r.contains("french") {
+        vec!["fr_fr".to_string(), "fr".to_string(), "FR".to_string()]
+    } else if r.contains("de") || r.contains("deut") || r.contains("german") || r.contains("deutsch") {
+        vec!["de_de".to_string(), "de".to_string(), "DE".to_string()]
+    } else if r.len() == 2 {
+        // Two-letter code provided
+        vec![r.clone(), r.to_uppercase()]
+    } else if r.contains('_') {
+        vec![r.clone()]
+    } else {
+        // Fallback: try lower/upper two-letter and full
+        let two = r.chars().take(2).collect::<String>();
+        vec![format!("{}_{}", two, two), two.clone(), two.to_uppercase()]
+    }
+}
+
 // Prüfe ob ein Token isoliert im Dateinamen vorkommt (z.B. -en-, _en_, en. oder am Ende/Anfang),
 // ohne dass es Teil eines größeren Wortes ist (vermeidet Matches in "endkunde").
 fn isolated_token_present(haystack: &str, token: &str) -> bool {
@@ -1511,12 +1565,20 @@ fn load_group_config(group: &str, language: &str, is_messe: bool) -> Config {
     
     // Kandidatenreihenfolge: group+lang(+messe) -> group(+messe) -> generic (+messe variants)
     let mut candidates = Vec::new();
+    let lang_variants = get_language_code_variants(language);
     if is_messe {
-        candidates.push(config_dir.join(format!("config_{}_{}_messe.toml", group.to_lowercase(), language.to_lowercase())));
+        // Try variants with '-' and '_' separators and different cases
+        for lv in &lang_variants {
+            candidates.push(config_dir.join(format!("config_{}-{}_messe.toml", group.to_lowercase(), lv)));
+            candidates.push(config_dir.join(format!("config_{}_{}_messe.toml", group.to_lowercase(), lv)));
+        }
         candidates.push(config_dir.join(format!("config_{}_messe.toml", group.to_lowercase())));
         candidates.push(config_dir.join("config_messe.toml"));
     }
-    candidates.push(config_dir.join(format!("config_{}_{}.toml", group.to_lowercase(), language.to_lowercase())));
+    for lv in &lang_variants {
+        candidates.push(config_dir.join(format!("config_{}-{}.toml", group.to_lowercase(), lv)));
+        candidates.push(config_dir.join(format!("config_{}_{}.toml", group.to_lowercase(), lv)));
+    }
     candidates.push(config_dir.join(format!("config_{}.toml", group.to_lowercase())));
     candidates.push(config_dir.join("config.toml"));
 
@@ -1532,9 +1594,11 @@ fn load_group_config(group: &str, language: &str, is_messe: bool) -> Config {
             println!("✅ GEFUNDEN: Lade gruppenspezifische Config von: {}", c_str);
             if let Ok(toml) = std::fs::read_to_string(c) {
                 println!("Config-Inhalt aus {}:\n{}", c_str, toml);
-                
+
                 // Parse TOML direkt statt über temp Dateien
                 let result = parse_toml_to_config(&toml);
+                // Remember the exact file path we loaded so saves write back to the same file
+                set_current_config_path(c);
                 println!("=== LOAD_GROUP_CONFIG ABGESCHLOSSEN - VERWENDE: {} ===", c_str);
                 return result;
             }
@@ -3116,11 +3180,48 @@ impl App for MyApp {
                         // Linke Seite - DIN A4 Darstellung
                         ui.vertical(|ui| {
                             ui.horizontal(|ui| {
-                                ui.label("Ziehen Sie die Elemente an die gewünschte Position:");
-                                if ui.button("🔄 Config neu laden").clicked() {
-                                    self.config = load_group_config(&self.selected_group, &self.selected_language, self.is_messe);
-                                    println!("Gruppenspezifische Config manuell neu geladen!");
-                                }
+                                ui.vertical(|ui| {
+                                    ui.label("Ziehen Sie die Elemente an die gewünschte Position:");
+                                    if ui.small_button("🔄 Neu laden").clicked() {
+                                        self.config = load_group_config(&self.selected_group, &self.selected_language, self.is_messe);
+                                        println!("Gruppenspezifische Config manuell neu geladen!");
+                                    }
+                                });
+
+                                ui.separator();
+
+                                ui.vertical(|ui| {
+                                    ui.label("Aktuelle Config");
+                                    if let Some(p) = get_current_config_path() {
+                                        let s = p.display().to_string();
+                                        let short = if s.len() > 48 { format!("...{}", &s[s.len()-45..]) } else { s };
+                                        ui.monospace(short);
+                                    } else {
+                                        ui.monospace("(keine spezifische Datei)");
+                                    }
+                                });
+
+                                ui.with_layout(egui::Layout::right_to_left(egui::Align::TOP), |ui| {
+                                    ui.vertical(|ui| {
+                                        ui.label(egui::RichText::new("Speichern").strong());
+                                        ui.horizontal(|ui| {
+                                            if ui.button("Speichern").clicked() {
+                                                // Quick-save: try to save to loaded path, else fallback to group file
+                                                save_group_config(&self.selected_group, &self.selected_language, self.is_messe, &self.config);
+                                            }
+                                            if ui.small_button("⇩").on_hover_text("Speichern unter...").clicked() {
+                                                self.show_save_as = true;
+                                                // Pre-fill suggestion
+                                                if let Some(p) = get_current_config_path() {
+                                                    self.config_save_path = p.display().to_string();
+                                                } else {
+                                                    let suggested = format!("CONFIG/config_{}-{}.toml", self.selected_group.to_lowercase(), self.selected_language.chars().take(2).collect::<String>());
+                                                    self.config_save_path = suggested;
+                                                }
+                                            }
+                                        });
+                                    });
+                                });
                             });
                             
                             // DIN A4 Verhältnis: 210mm x 297mm ≈ 1:1.414
@@ -3392,6 +3493,44 @@ impl App for MyApp {
                                 }
                             }
                         });
+
+                        // Speichern-unter Modal
+                        if self.show_save_as {
+                            egui::Window::new("Speichern unter")
+                                .collapsible(false)
+                                .resizable(false)
+                                .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
+                                .show(ctx, |ui| {
+                                    ui.label("Dateiname (z. B. CONFIG/config_fachkreise-DE.toml):");
+                                    ui.text_edit_singleline(&mut self.config_save_path);
+                                    ui.horizontal(|ui| {
+                                        if ui.button("Speichern").clicked() {
+                                            let p = std::path::Path::new(&self.config_save_path);
+                                            match save_group_config_to_path(p, &self.config) {
+                                                Ok(_) => {
+                                                    println!("Config gespeichert nach {:?}", p);
+                                                    set_current_config_path(p);
+                                                    self.show_save_as = false;
+                                                }
+                                                Err(e) => {
+                                                    eprintln!("Fehler beim Speichern: {}", e);
+                                                }
+                                            }
+                                        }
+                                        if ui.button("Durchsuchen").clicked() {
+                                            // Open native save dialog
+                                            if let Some(path) = rfd::FileDialog::new().set_directory("CONFIG").save_file() {
+                                                if let Some(s) = path.to_str() {
+                                                    self.config_save_path = s.to_string();
+                                                }
+                                            }
+                                        }
+                                        if ui.button("Abbrechen").clicked() {
+                                            self.show_save_as = false;
+                                        }
+                                    });
+                                });
+                        }
                         
                         ui.separator();
                         
@@ -3923,6 +4062,10 @@ fn generate_qr(link: &str) -> (Vec<u8>, usize) {
 static mut CURRENT_CONFIG: Option<Config> = None;
 static CONFIG_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+// Track the last-loaded config file path in a safe Mutex for multi-threaded access
+use once_cell::sync::Lazy;
+static CURRENT_CONFIG_PATH: Lazy<std::sync::Mutex<Option<std::path::PathBuf>>> = Lazy::new(|| std::sync::Mutex::new(None));
+
 // Funktion um die aktuelle Config zu setzen (threadsafe)
 fn set_current_config(config: &Config) {
     let _lock = CONFIG_MUTEX.lock().unwrap();
@@ -3931,6 +4074,17 @@ fn set_current_config(config: &Config) {
     }
     println!("Aktuelle Config gesetzt für PDF-Generierung: QR={:?}, Vertreter={:?}", 
              config.qr_codes, config.vertreter);
+}
+
+fn set_current_config_path(path: &std::path::Path) {
+    let mut g = CURRENT_CONFIG_PATH.lock().unwrap();
+    *g = Some(path.to_path_buf());
+    println!("Aktuelle Config-Datei gesetzt: {:?}", path);
+}
+
+fn get_current_config_path() -> Option<std::path::PathBuf> {
+    let g = CURRENT_CONFIG_PATH.lock().unwrap();
+    g.clone()
 }
 
 
@@ -4349,7 +4503,7 @@ fn modify_pdf_with_debug(template_path: &str, kundennr: &str, qr_code: &[u8], qr
                 page_number, qr_codes_for_page.len(), vertreter_for_page.len()), debug_enabled);
                 
             process_page_elements(&mut doc, page_id, page_number, &qr_codes_for_page, &vertreter_for_page, 
-                                  kundennr, maybe_image_id, debug_enabled);
+                                  kundennr, maybe_image_id, Some(qr_width), debug_enabled);
         } else {
             debug_print(&format!("Seite {} übersprungen - keine Elemente zu platzieren", page_number), debug_enabled);
         }
@@ -4382,7 +4536,7 @@ fn modify_pdf_with_debug(template_path: &str, kundennr: &str, qr_code: &[u8], qr
 
 fn process_page_elements(doc: &mut Document, page_id: lopdf::ObjectId, _page_number: u32,
                          qr_codes: &[&QrCodeConfig], vertreter_configs: &[&VertreterConfig], 
-                         kundennr: &str, maybe_image_id: Option<lopdf::ObjectId>, _debug_enabled: bool) {
+                         kundennr: &str, maybe_image_id: Option<lopdf::ObjectId>, maybe_image_width: Option<usize>, _debug_enabled: bool) {
     
     let content_stream = doc.get_page_content(page_id).expect("Konnte Seiteninhalt nicht laden");
     let mut content = Content::decode(&content_stream).expect("Konnte Inhalt nicht dekodieren");
@@ -4390,9 +4544,11 @@ fn process_page_elements(doc: &mut Document, page_id: lopdf::ObjectId, _page_num
     // Alle QR-Codes platzieren
     for (i, qr_config) in qr_codes.iter().enumerate() {
         if let Some(_img_id) = maybe_image_id {
+            // Compute image-space -> user-space scale so that the drawn image width equals qr_config.size points
+            let scale = if let Some(w) = maybe_image_width { qr_config.size / (w as f32) } else { qr_config.size };
             content.operations.push(Operation::new("q", vec![]));
             content.operations.push(Operation::new("cm", vec![
-                qr_config.size.into(), 0.into(), 0.into(), qr_config.size.into(), 
+                (scale).into(), 0.into(), 0.into(), (scale).into(), 
                 qr_config.x.into(), qr_config.y.into()
             ]));
             content.operations.push(Operation::new("Do", vec![Object::Name(format!("Im{}", i + 1).into_bytes())]));
