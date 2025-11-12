@@ -3,6 +3,7 @@
 // Bestellscheine mit integrierter UI
 use eframe::egui;
 use eframe::App;
+use serde::{Serialize, Deserialize};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::fs;
@@ -417,7 +418,7 @@ fn get_configured_output_dir_with_debug(use_custom: bool, custom_path: &str, gro
 ///                                      font_path: "".to_string() }],
 /// };
 /// ```
-#[derive(Clone)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct Config {
     /// Liste der QR-Code-Konfigurationen
     pub qr_codes: Vec<QrCodeConfig>,
@@ -428,7 +429,7 @@ pub struct Config {
 /// Konfiguration für QR-Code-Platzierung
 /// 
 /// Definiert Position, Größe und auf welchen Seiten der QR-Code erscheinen soll.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct QrCodeConfig {
     /// X-Position in PDF-Punkten (von links)
     pub x: f32,
@@ -438,7 +439,7 @@ pub struct QrCodeConfig {
     pub all_pages: bool,      // Wenn true, ignoriere pages und verwende alle Seiten
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct VertreterConfig {
     pub x: f32,
     pub y: f32,
@@ -703,11 +704,12 @@ fn parse_toml_to_config(toml: &str) -> Config {
                 in_qr_array = false;
                 continue;
             }
-            if l.contains("x =") && l.contains("y =") {
+                if l.contains("x =") && l.contains("y =") {
                 let mut x = 50.0;
                 let mut y = 50.0;
                 let mut size = 18.0;
                 let mut all_pages = false;
+                let mut pages_vec: Vec<u32> = Vec::new();
                 for part in l.trim_matches(|c| c == '{' || c == '}' || c == ',').split(',') {
                     let part = part.trim();
                     if part.starts_with("x =") {
@@ -718,9 +720,32 @@ fn parse_toml_to_config(toml: &str) -> Config {
                         size = part[6..].trim().parse().unwrap_or(18.0);
                     } else if part.starts_with("all_pages =") {
                         all_pages = part[11..].trim() == "true";
+                    } else if part.starts_with("pages =") {
+                        // pages can be written as a quoted semicolon-separated string or as an array; try to parse both
+                        let mut rhs = part[7..].trim().trim_matches(',').trim().to_string();
+                        // remove surrounding quotes if present
+                        if rhs.starts_with('"') && rhs.ends_with('"') {
+                            rhs = rhs.trim_matches('"').to_string();
+                        }
+                        if rhs.eq_ignore_ascii_case("ALL") {
+                            all_pages = true;
+                        } else if rhs.starts_with('[') && rhs.ends_with(']') {
+                            let inner = rhs.trim_start_matches('[').trim_end_matches(']');
+                            for tok in inner.split(',') {
+                                if let Ok(n) = tok.trim().parse::<u32>() { pages_vec.push(n); }
+                            }
+                        } else {
+                            // semicolon or comma separated values
+                            for tok in rhs.split(|c| c == ';' || c == ',') {
+                                let t = tok.trim();
+                                if t.is_empty() { continue; }
+                                if let Ok(n) = t.parse::<u32>() { pages_vec.push(n); }
+                            }
+                        }
                     }
                 }
-                qr_codes.push(QrCodeConfig { x, y, size, pages: vec![1], all_pages });
+                if pages_vec.is_empty() { pages_vec.push(1); }
+                qr_codes.push(QrCodeConfig { x, y, size, pages: pages_vec, all_pages });
             }
         }
 
@@ -733,7 +758,7 @@ fn parse_toml_to_config(toml: &str) -> Config {
                 in_vertreter_array = false;
                 continue;
             }
-            if l.contains("x =") && l.contains("y =") {
+                if l.contains("x =") && l.contains("y =") {
                 let mut x = 0.0;
                 let mut y = 0.0;
                 let mut size = 12.0; // Default size für Vertreter
@@ -741,6 +766,7 @@ fn parse_toml_to_config(toml: &str) -> Config {
                 let mut font_size = 12.0;
                 let mut font_style = "Normal".to_string();
                 let mut all_pages = false;
+                let mut pages_vec: Vec<u32> = Vec::new();
                 
                 for part in l.trim_matches(|c| c == '{' || c == '}' || c == ',').split(',') {
                     let part = part.trim();
@@ -758,6 +784,23 @@ fn parse_toml_to_config(toml: &str) -> Config {
                         font_style = part[12..].trim().trim_matches('"').to_string();
                     } else if part.starts_with("all_pages =") {
                         all_pages = part[11..].trim() == "true";
+                    } else if part.starts_with("pages =") {
+                        let mut rhs = part[7..].trim().trim_matches(',').trim().to_string();
+                        if rhs.starts_with('"') && rhs.ends_with('"') { rhs = rhs.trim_matches('"').to_string(); }
+                        if rhs.eq_ignore_ascii_case("ALL") {
+                            all_pages = true;
+                        } else if rhs.starts_with('[') && rhs.ends_with(']') {
+                            let inner = rhs.trim_start_matches('[').trim_end_matches(']');
+                            for tok in inner.split(',') {
+                                if let Ok(n) = tok.trim().parse::<u32>() { pages_vec.push(n); }
+                            }
+                        } else {
+                            for tok in rhs.split(|c| c == ';' || c == ',') {
+                                let t = tok.trim();
+                                if t.is_empty() { continue; }
+                                if let Ok(n) = t.parse::<u32>() { pages_vec.push(n); }
+                            }
+                        }
                     }
                 }
                 
@@ -766,7 +809,8 @@ fn parse_toml_to_config(toml: &str) -> Config {
                     font_size = size;
                 }
                 
-                vertreter.push(VertreterConfig { x, y, size, pages: vec![1], all_pages, font_name, font_size, font_style });
+                if pages_vec.is_empty() { pages_vec.push(1); }
+                vertreter.push(VertreterConfig { x, y, size, pages: pages_vec, all_pages, font_name, font_size, font_style });
             }
         }
 
@@ -850,7 +894,7 @@ fn save_group_config(group: &str, language: &str, is_messe: bool, config: &Confi
     
     // If we have a previously loaded config path, prefer saving back to it
     if let Some(p) = get_current_config_path() {
-        if let Err(e) = std::fs::write(&p, toml.clone()) {
+        if let Err(e) = save_group_config_to_path(&p, &config) {
             eprintln!("Konnte gruppenspezifische Config nicht in geladenem Pfad {:?} speichern: {}", p, e);
         } else {
             println!("✅ Gruppenspezifische Config gespeichert (geladene Datei): {:?}", p);
@@ -859,7 +903,7 @@ fn save_group_config(group: &str, language: &str, is_messe: bool, config: &Confi
         }
     }
 
-    // Fallback: write to default group filename
+    // Fallback: write to default group filename (TOML)
     if let Err(e) = std::fs::write(&group_filename, toml) {
         eprintln!("Konnte gruppenspezifische Config nicht speichern: {}", e);
     } else {
@@ -871,20 +915,42 @@ fn save_group_config(group: &str, language: &str, is_messe: bool, config: &Confi
 
 // Helper to explicitly save to a path (used by UI when user chooses "In Datei speichern")
 fn save_group_config_to_path(path: &std::path::Path, config: &Config) -> Result<(), std::io::Error> {
-    let mut toml = String::new();
-    toml.push_str("# Manuell gespeicherte Config\n");
-    toml.push_str("qr_codes = [\n");
-    for qr in &config.qr_codes {
-        toml.push_str(&format!("  {{ x = {}, y = {}, size = {}, all_pages = {} }},\n", qr.x, qr.y, qr.size, qr.all_pages));
+    // Determine target format by file extension
+    let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("").to_lowercase();
+    if ext == "yaml" || ext == "yml" {
+        // Use serde_yaml to serialize the Config struct to YAML
+        match serde_yaml::to_string(config) {
+            Ok(yaml) => std::fs::write(path, yaml),
+            Err(e) => Err(std::io::Error::new(std::io::ErrorKind::Other, format!("YAML-Serailize Fehler: {}", e)))
+        }
+    } else {
+        // Default: write TOML-compatible hand-crafted representation for backwards compatibility
+        let mut toml = String::new();
+        toml.push_str("# Manuell gespeicherte Config\n");
+        toml.push_str("qr_codes = [\n");
+        for qr in &config.qr_codes {
+            // pages: if all_pages -> write "ALL", else write semicolon-separated string like "1;2;3"
+            let pages_str = if qr.all_pages {
+                "ALL".to_string()
+            } else {
+                qr.pages.iter().map(|n| n.to_string()).collect::<Vec<_>>().join(";")
+            };
+            toml.push_str(&format!("  {{ x = {}, y = {}, size = {}, all_pages = {}, pages = \"{}\" }},\n", qr.x, qr.y, qr.size, qr.all_pages, pages_str));
+        }
+        toml.push_str("]\n\n");
+        toml.push_str("[positions]\n");
+        toml.push_str("vertreter_nummer = [\n");
+        for v in &config.vertreter {
+            let pages_str = if v.all_pages {
+                "ALL".to_string()
+            } else {
+                v.pages.iter().map(|n| n.to_string()).collect::<Vec<_>>().join(";")
+            };
+            toml.push_str(&format!("  {{ x = {}, y = {}, size = {}, all_pages = {}, pages = \"{}\", font_name = \"{}\", font_size = {}, font_style = \"{}\" }},\n", v.x, v.y, v.size, v.all_pages, pages_str, v.font_name, v.font_size, v.font_style));
+        }
+        toml.push_str("]\n");
+        std::fs::write(path, toml)
     }
-    toml.push_str("]\n\n");
-    toml.push_str("[positions]\n");
-    toml.push_str("vertreter_nummer = [\n");
-    for v in &config.vertreter {
-        toml.push_str(&format!("  {{ x = {}, y = {}, size = {}, all_pages = {}, font_name = \"{}\", font_size = {}, font_style = \"{}\" }},\n", v.x, v.y, v.size, v.all_pages, v.font_name, v.font_size, v.font_style));
-    }
-    toml.push_str("]\n");
-    std::fs::write(path, toml)
 }
 
 // Resume-Funktionalität: Prüfen ob bereits PDFs erstellt wurden
@@ -926,6 +992,27 @@ fn get_last_processed_count() -> usize {
         count
     } else {
         0
+    }
+}
+
+// Populate recent config list from CONFIG directory at startup
+fn populate_recent_configs_from_dir() {
+    let config_dir = std::path::Path::new("CONFIG");
+    if !config_dir.exists() { return; }
+    if let Ok(entries) = std::fs::read_dir(config_dir) {
+        let mut list = RECENT_CONFIGS.lock().unwrap();
+        for e in entries.flatten() {
+            if let Some(name) = e.path().file_name().and_then(|s| s.to_str()) {
+                if name.starts_with("config_") && (name.ends_with(".toml") || name.ends_with(".yaml") || name.ends_with(".yml")) {
+                    let p = e.path().display().to_string();
+                    if !list.contains(&p) {
+                        list.push(p);
+                    }
+                }
+            }
+        }
+        // newest first
+        list.reverse();
     }
 }
 
@@ -996,14 +1083,21 @@ pub struct MyApp {
     // UI helpers for saving config
     config_save_path: String,
     show_save_as: bool,
+    // Dedicated window for managing elements in case the right-side panel is not visible
+    show_elements_window: bool,
+    // Help modal for quick onboarding/help text
+    show_help: bool,
+    // Persistent README viewer (so the README can be opened without the help window closing)
+    show_readme_window: bool,
+    readme_text: Option<String>,
     // Full PDF preview state (removed - kept preview lightweight)
 }
 
 impl Default for MyApp {
     fn default() -> Self {
-        // Progress-Datei initial löschen/erstellen (versteckt)
+    // Progress-Datei initial löschen/erstellen (versteckt)
         let progress_path = get_temp_file_path("progress.txt");
-        let _ = std::fs::write(&progress_path, "0.0");
+        let _ = std::fs::write(&progress_path, "0.0"); // Initial progress file creation
 
         // Stop-Status-Datei löschen falls vorhanden (versteckt)
         let stop_status_path = get_temp_file_path("stop_status.txt");
@@ -1041,6 +1135,8 @@ impl Default for MyApp {
 
         // Gruppenspezifische Config beim Start laden statt globaler Config
         let initial_config = load_group_config(&default_group, &default_language, default_is_messe);
+    // Prefill recent config list from CONFIG folder
+    populate_recent_configs_from_dir();
         let initial_resume_info = load_resume_info(&default_group, &default_language, default_is_messe);
 
         // Manual input fields basierend auf der geladenen Config setzen
@@ -1119,6 +1215,10 @@ impl Default for MyApp {
             selected_element: None,
             config_save_path: String::new(),
             show_save_as: false,
+            show_elements_window: false,
+            show_help: false,
+            show_readme_window: false,
+            readme_text: None,
             // preview state removed
         }
     }
@@ -1563,24 +1663,51 @@ fn load_group_config(group: &str, language: &str, is_messe: bool) -> Config {
     // Release-Ordnerstruktur verwenden - Config-Verzeichnis ist jetzt sichtbar für User
     let (config_dir, _, _, _, _) = get_release_dirs();
     
-    // Kandidatenreihenfolge: group+lang(+messe) -> group(+messe) -> generic (+messe variants)
-    let mut candidates = Vec::new();
+    // Kandidatenreihenfolge: prefer messe-specific filenames when is_messe==true.
+    // Support multiple extensions (.yaml, .yml, .toml) and a simple plural group variant (e.g., endkunde -> endkunden)
+    let mut candidates: Vec<std::path::PathBuf> = Vec::new();
     let lang_variants = get_language_code_variants(language);
+    let group_lower = group.to_lowercase();
+    // simple plural form: append 'n' if not already ending with 'n' (covers Endkunde -> Endkunden)
+    let group_plural = if group_lower.ends_with('n') { group_lower.clone() } else { format!("{}n", group_lower) };
+
+    let exts = ["yaml", "yml", "toml"];
+
     if is_messe {
-        // Try variants with '-' and '_' separators and different cases
+        // Highest priority: config_messe_<group>-<lang>.<ext> and plural variant
         for lv in &lang_variants {
-            candidates.push(config_dir.join(format!("config_{}-{}_messe.toml", group.to_lowercase(), lv)));
-            candidates.push(config_dir.join(format!("config_{}_{}_messe.toml", group.to_lowercase(), lv)));
+            for ext in &exts {
+                candidates.push(config_dir.join(format!("config_messe_{}-{}.{}", group_lower, lv, ext)));
+                candidates.push(config_dir.join(format!("config_messe_{}-{}.{}", group_plural, lv, ext)));
+            }
         }
-        candidates.push(config_dir.join(format!("config_{}_messe.toml", group.to_lowercase())));
-        candidates.push(config_dir.join("config_messe.toml"));
+        // Also accept patterns where messe sits at the end (backwards compatibility)
+        for lv in &lang_variants {
+            for ext in &exts {
+                candidates.push(config_dir.join(format!("config_{}-{}_messe.{}", group_lower, lv, ext)));
+                candidates.push(config_dir.join(format!("config_{}_{}_messe.{}", group_lower, lv, ext)));
+            }
+        }
+        // Generic messe file names
+        for ext in &exts {
+            candidates.push(config_dir.join(format!("config_{}_messe.{}", group_lower, ext)));
+            candidates.push(config_dir.join(format!("config_messe.{}", ext)));
+        }
     }
+
+    // Non-messe candidates (group+lang, with ext variants)
     for lv in &lang_variants {
-        candidates.push(config_dir.join(format!("config_{}-{}.toml", group.to_lowercase(), lv)));
-        candidates.push(config_dir.join(format!("config_{}_{}.toml", group.to_lowercase(), lv)));
+        for ext in &exts {
+            candidates.push(config_dir.join(format!("config_{}-{}.{}", group_lower, lv, ext)));
+            candidates.push(config_dir.join(format!("config_{}_{}.{}", group_lower, lv, ext)));
+        }
     }
-    candidates.push(config_dir.join(format!("config_{}.toml", group.to_lowercase())));
-    candidates.push(config_dir.join("config.toml"));
+
+    // Fallback generic group and global config
+    for ext in &exts {
+        candidates.push(config_dir.join(format!("config_{}.{}", group_lower, ext)));
+        candidates.push(config_dir.join(format!("config.{}", ext)));
+    }
 
     println!("CONFIG-Verzeichnis: {:?}", config_dir);
     println!("Prüfe Config-Kandidaten in Reihenfolge:");
@@ -1591,16 +1718,12 @@ fn load_group_config(group: &str, language: &str, is_messe: bool) -> Config {
     for c in &candidates {
         if c.exists() {
             let c_str = c.to_string_lossy();
-            println!("✅ GEFUNDEN: Lade gruppenspezifische Config von: {}", c_str);
-            if let Ok(toml) = std::fs::read_to_string(c) {
-                println!("Config-Inhalt aus {}:\n{}", c_str, toml);
-
-                // Parse TOML direkt statt über temp Dateien
-                let result = parse_toml_to_config(&toml);
-                // Remember the exact file path we loaded so saves write back to the same file
-                set_current_config_path(c);
+            println!("✅ GEFUNDEN: Versuche zu laden: {}", c_str);
+            if let Some(cfg) = try_load_config_file(c) {
                 println!("=== LOAD_GROUP_CONFIG ABGESCHLOSSEN - VERWENDE: {} ===", c_str);
-                return result;
+                return cfg;
+            } else {
+                println!("⚠️ GEFUNDEN aber konnte nicht geparst werden: {}", c_str);
             }
         } else {
             println!("❌ NICHT VORHANDEN: {:?}", c);
@@ -1626,11 +1749,13 @@ fn load_group_config(group: &str, language: &str, is_messe: bool) -> Config {
         }
     }
 
-    // Bevorzugte Filename für die Gruppe; wenn Messe, erstelle messe-spezifische Datei
+    // Bevorzugte Filename für die Gruppe; wenn Messe, erstelle messe-spezifische Datei.
+    // Use language code in the filename so per-language configs are created (e.g. config_apo-de_de.toml)
+    let lang_code = get_language_code_variants(language).get(0).cloned().unwrap_or_else(|| language.chars().take(2).collect());
     let group_filename = if is_messe {
-        config_dir.join(format!("config_{}_messe.toml", group.to_lowercase()))
+        config_dir.join(format!("config_messe_{}-{}.toml", group.to_lowercase(), lang_code))
     } else {
-        config_dir.join(format!("config_{}.toml", group.to_lowercase()))
+        config_dir.join(format!("config_{}-{}.toml", group.to_lowercase(), lang_code))
     };
     
     // Falls die Gruppendatei noch nicht existiert, schreibe eine Default-Konfiguration hinein
@@ -1981,18 +2106,28 @@ impl App for MyApp {
                     .on_hover_text("Bestellscheine - B Logo");
                 
                 ui.separator();
-                
-                // Entfernt - Konfiguration jetzt neben Settings-Icon
-                
-                if ui.button(" Auswahl treffen").clicked() {
+
+                // Quick selection helper
+                let sel_btn = ui.button(" Auswahl treffen");
+                if sel_btn.clicked() {
                     self.show_startup_dialog = true;
                 }
+                sel_btn.on_hover_text("Öffnet den Auswahl-Dialog (CSV + Template) zum Überprüfen oder Ändern der Eingabedateien");
+
+                let help_btn = ui.small_button("❓ Hilfe");
+                if help_btn.clicked() {
+                    self.show_help = true;
+                }
+                help_btn.on_hover_text("Kurzhilfe öffnen");
+
+                ui.separator();
                 
                 ui.separator();
                 
                 // BEREICHS-AUSWAHL für Vertreternummern
                 ui.horizontal(|ui| {
-                    if ui.checkbox(&mut self.use_range_selection, "📊 Nur bestimmten Bereich generieren").clicked() {
+                    let range_resp = ui.checkbox(&mut self.use_range_selection, "📊 Nur bestimmten Bereich generieren");
+                    if range_resp.clicked() {
                         if self.use_range_selection {
                             // Beim ersten Aktivieren, versuche Gesamtanzahl zu bestimmen
                             if let Some(csv_path) = self.get_current_csv_path() {
@@ -2004,6 +2139,7 @@ impl App for MyApp {
                             }
                         }
                     }
+                    range_resp.on_hover_text("Ermöglicht das Verarbeiten nur eines Bereichs der CSV (von Index bis Index)");
                     
                     if self.use_range_selection {
                         ui.separator();
@@ -2045,7 +2181,7 @@ impl App for MyApp {
                 ui.separator();
                 
                 // HAUPTBUTTON: Bestellscheine generieren
-                if !self.is_generating {
+                    if !self.is_generating {
                     // Primärer Button: Erstellen oder Fortsetzen  
                     let button_text = if self.resume_available {
                         format!("📄 Fortsetzen ({} bereits erstellt)", self.last_processed_count)
@@ -2057,7 +2193,8 @@ impl App for MyApp {
                     let generate_button = egui::Button::new(egui::RichText::new(button_text).size(16.0))
                         .fill(egui::Color32::from_rgb(46, 125, 50)); // Grün
                     
-                    if ui.add(generate_button).clicked() {
+                    let gen_resp = ui.add(generate_button);
+                    if gen_resp.clicked() {
                         let mut can_start = true;
                         // Ensure a selection exists. If not, set it from current UI state (but don't auto-start the dialog)
                         if get_current_selections().is_none() {
@@ -2091,6 +2228,8 @@ impl App for MyApp {
                             let group_cfg = load_group_config(&self.selected_group, &self.selected_language, self.is_messe);
                             self.config = group_cfg;
                         }
+                    // Tooltip after handling click to avoid moving the Response
+                    gen_resp.on_hover_text("Startet die Erstellung der PDFs. Verwende Stop um den Prozess zu unterbrechen.");
 
                         if !can_start {
                             // Do not start threads when files missing
@@ -2558,6 +2697,28 @@ impl App for MyApp {
                         }
                     });
 
+                    // Messe-Option direkt unter der Sprachwahl platzieren (sinnvollere Position)
+                    ui.horizontal(|ui| {
+                        ui.label("Messescheine:").on_hover_text("Schalte Messe-spezifische Vorlagen und Configs ein");
+                        if ui.selectable_label(self.is_messe, "Ja (Messe)").clicked() {
+                            self.is_messe = !self.is_messe;
+                            // Sofort messe-spezifische Config laden
+                            let group_cfg = load_group_config(&self.selected_group, &self.selected_language, self.is_messe);
+                            self.config = group_cfg;
+                            // Update manual input fields
+                            if !self.config.qr_codes.is_empty() {
+                                self.manual_qr_x = format!("{:.1}", self.config.qr_codes[0].x);
+                                self.manual_qr_y = format!("{:.1}", self.config.qr_codes[0].y);
+                                self.manual_qr_size = format!("{:.1}", self.config.qr_codes[0].size);
+                            }
+                            if !self.config.vertreter.is_empty() {
+                                self.manual_vertreter_x = format!("{:.1}", self.config.vertreter[0].x);
+                                self.manual_vertreter_y = format!("{:.1}", self.config.vertreter[0].y);
+                            }
+                            println!("Messe-Option geändert zu {} - Config neu geladen", self.is_messe);
+                        }
+                    });
+
                     ui.separator();
                     ui.label("Sprache:");
                     ui.horizontal(|ui| {
@@ -2598,31 +2759,76 @@ impl App for MyApp {
                     });
 
                     ui.separator();
+                    // Anzeige welche Config aktuell verwendet wird (Dateipfad oder Hinweis wenn keine spezifische Datei)
+                    ui.horizontal(|ui| {
+                        ui.label("Verwendete Config:").on_hover_text("Die Config-Datei, die aktuell geladen ist (falls vorhanden)");
+                        if let Some(p) = get_current_config_path() {
+                            let s = p.display().to_string();
+                            let short = if s.len() > 48 { format!("...{}", &s[s.len()-45..]) } else { s.clone() };
+                            // Show badge with source
+                            let source = detect_config_source(&p);
+                            let badge_color = match source {
+                                "preset" => egui::Color32::from_rgb(0, 180, 200),
+                                "messe" => egui::Color32::from_rgb(230, 120, 0),
+                                "group" => egui::Color32::from_rgb(0, 140, 60),
+                                _ => egui::Color32::GRAY,
+                            };
+                            ui.colored_label(badge_color, format!("[{}]", source));
+                            ui.monospace(short).on_hover_text(
+                                file_modified_time_str(&p).map(|t| format!("Zuletzt geändert: {}", t)).unwrap_or_else(|| "Datum unbekannt".to_string())
+                            );
+                            if ui.small_button("🔍 Öffnen").on_hover_text("Öffnet den Konfigurationsdialog").clicked() {
+                                self.show_config = true;
+                            }
+                        } else {
+                            ui.monospace("(keine spezifische Datei)").on_hover_text("Es wurde keine gruppenspezifische Config gefunden; es wird die Standard-Config verwendet");
+                            if ui.small_button("➕ Konfiguration anlegen").on_hover_text("Erstellt eine neue gruppenspezifische Config und öffnet den Editor").clicked() {
+                                // Erzeuge eine Config-Datei für die aktuelle Gruppe/Sprache (schreibt ins Default-Ziel)
+                                save_group_config(&self.selected_group, &self.selected_language, self.is_messe, &self.config);
+                                // Neu laden, damit der Pfad und intern gesetzte Werte aktualisiert werden
+                                self.config = load_group_config(&self.selected_group, &self.selected_language, self.is_messe);
+                                self.show_config = true;
+                            }
+                        }
+                        // Preset Dropdown (lesbare Namen)
+                        ui.separator();
+                        ui.label("Preset: ").on_hover_text("Schnell ein vordefiniertes Preset laden");
+                        let mut preset_files: Vec<(String, std::path::PathBuf)> = Vec::new();
+                        if let Ok(entries) = std::fs::read_dir("CONFIG/presets") {
+                            for en in entries.flatten() {
+                                let path = en.path();
+                                if path.is_file() {
+                                    if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
+                                        preset_files.push((stem.to_string(), path));
+                                    }
+                                }
+                            }
+                        }
+                        if preset_files.is_empty() {
+                            ui.label("(keine Presets)").on_hover_text("Lege YAML-Dateien in CONFIG/presets ab, z. B. 'messe_endkunde.yaml'");
+                        } else {
+                            egui::ComboBox::from_label("")
+                                .selected_text("Wähle Preset")
+                                .show_ui(ui, |ui| {
+                                    for (name, path) in preset_files.iter() {
+                                        if ui.selectable_label(false, name).on_hover_text(path.display().to_string()).clicked() {
+                                            if let Some(cfg) = try_load_config_file(&path) {
+                                                self.config = cfg;
+                                                set_current_config_path(&path);
+                                                println!("Preset geladen aus Startup-Dialog: {:?}", path);
+                                            } else {
+                                                println!("Konnte Preset nicht laden: {:?}", path);
+                                            }
+                                        }
+                                    }
+                                });
+                        }
+                    });
+
+                    ui.separator();
                     ui.label("Hinweis: Es werden nur die für die Auswahl relevanten QR-Codes und Vorlagen verwendet.");
 
-                        ui.separator();
-                        ui.horizontal(|ui| {
-                            ui.label("Messescheine:");
-                            if ui.selectable_label(self.is_messe, "Ja (Messe)").clicked() {
-                                self.is_messe = !self.is_messe;
-                                // Sofort messe-spezifische Config laden
-                                let group_cfg = load_group_config(&self.selected_group, &self.selected_language, self.is_messe);
-                                self.config = group_cfg;
-                                // Update manual input fields
-                                if !self.config.qr_codes.is_empty() {
-                                    self.manual_qr_x = format!("{:.1}", self.config.qr_codes[0].x);
-                                    self.manual_qr_y = format!("{:.1}", self.config.qr_codes[0].y);
-                                    self.manual_qr_size = format!("{:.1}", self.config.qr_codes[0].size);
-                                }
-                                if !self.config.vertreter.is_empty() {
-                                    self.manual_vertreter_x = format!("{:.1}", self.config.vertreter[0].x);
-                                    self.manual_vertreter_y = format!("{:.1}", self.config.vertreter[0].y);
-                                }
-                                println!("Messe-Option geändert zu {} - Config neu geladen", self.is_messe);
-                            }
-                        });
-
-                    // Erweiterte Template-Auswahl mit Bewertung und Fallback
+                        // Erweiterte Template-Auswahl mit Bewertung und Fallback
                     ui.separator();
                     ui.label("� Datenherkunft:");
                     
@@ -2956,7 +3162,7 @@ impl App for MyApp {
                         ui.add_space(10.0);
                         ui.separator();
                         ui.label(egui::RichText::new("Bestellschein Generator").size(14.0).strong());
-                        ui.label(egui::RichText::new("Version 0.3.2").size(12.0));
+                        ui.label(egui::RichText::new("Version 0.3.3").size(12.0));
                         ui.add_space(5.0);
                         ui.label(egui::RichText::new("Programmentwicklung: Alexander Löschke, IT - Abteilung")
                             .strong()
@@ -3170,11 +3376,38 @@ impl App for MyApp {
                 }
                 
                 let mut show_config = self.show_config;
+                let close_requested = std::rc::Rc::new(std::cell::Cell::new(false));
+                // Cap the config dialog to the available application area so it's never wider than the app
+                let avail = ctx.available_rect();
+                // If the config overlay is narrow, auto-open the dedicated Elemente verwalten window
+                // This helps users on small windows where the right-side panel might be hidden.
+                let elements_auto_open_threshold = 900.0_f32;
+                if avail.width() < elements_auto_open_threshold && !self.show_elements_window {
+                    self.show_elements_window = true;
+                }
+                let _cfg_win_h = (avail.height() * 0.84).max(480.0).min(avail.height());
+                // Create a fixed overlay matching the available app area so the dialog never exceeds app width
                 egui::Window::new("Positionen auf DIN A4 konfigurieren")
                     .open(&mut show_config)
-                    .resizable(true)
-                    .default_size([800.0, 600.0])
+                    .resizable(false)
+                    .title_bar(false)
+                    .fixed_pos(egui::pos2(avail.left(), avail.top()))
+                    .fixed_size([avail.width(), avail.height()])
                     .show(ctx, |ui| {
+                        // Custom title bar (inside content) with close button
+                        ui.horizontal(|ui| {
+                            ui.heading("Positionen auf DIN A4 konfigurieren");
+                            // Always-visible button to open the Elemente verwalten window
+                            if ui.small_button("⚙ Elemente verwalten").on_hover_text("Öffne dediziertes Fenster um QR/Vertreter zu verwalten").clicked() {
+                                self.show_elements_window = true;
+                            }
+                            ui.with_layout(egui::Layout::right_to_left(egui::Align::TOP), |ui| {
+                                if ui.small_button("✖").clicked() {
+                                    // Request close without mutably borrowing show_config inside nested closures
+                                    close_requested.set(true);
+                                }
+                            });
+                        });
                     
                     ui.horizontal(|ui| {
                         // Linke Seite - DIN A4 Darstellung
@@ -3199,6 +3432,57 @@ impl App for MyApp {
                                     } else {
                                         ui.monospace("(keine spezifische Datei)");
                                     }
+
+                                    // Presets: Read YAML files from CONFIG/presets and offer quick-load
+                                    ui.separator();
+                                    ui.label("Vordefinierte Presets:").on_hover_text("Lade eine Beispiel-Konfiguration aus CONFIG/presets");
+                                    if let Ok(entries) = std::fs::read_dir("CONFIG/presets") {
+                                        let mut found = false;
+                                        for entry in entries.flatten() {
+                                            let path = entry.path();
+                                            if path.is_file() {
+                                                if let Some(fname) = path.file_name().and_then(|s| s.to_str()) {
+                                                    found = true;
+                                                    if ui.small_button(fname).on_hover_text("Preset laden").clicked() {
+                                                        if let Some(cfg) = try_load_config_file(&path) {
+                                                            self.config = cfg;
+                                                            set_current_config_path(&path);
+                                                            println!("Preset geladen: {:?}", path);
+                                                        } else {
+                                                            println!("Konnte Preset nicht laden: {:?}", path);
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                        if !found {
+                                            ui.label("(Keine Presets gefunden in CONFIG/presets)");
+                                        }
+                                    } else {
+                                        ui.label("(Kein Presets-Ordner: CONFIG/presets)");
+                                    }
+
+                                    if self.debug_mode {
+                                        let recent = get_recent_config_list();
+                                        if !recent.is_empty() {
+                                            ui.label("Zuletzt verwendete Configs:");
+                                            for (idx, r) in recent.iter().enumerate() {
+                                                ui.horizontal(|ui| {
+                                                    if ui.selectable_label(false, r.clone()).clicked() {
+                                                        if let Some(cfg) = load_config_from_path(std::path::Path::new(r)) {
+                                                            self.config = cfg;
+                                                            println!("Geladene Config von recent-liste: {}", r);
+                                                        }
+                                                    }
+                                                    if ui.small_button("🗑").on_hover_text("Aus Liste entfernen").clicked() {
+                                                        // remove from global recent list
+                                                        let mut list = RECENT_CONFIGS.lock().unwrap();
+                                                        if idx < list.len() { list.remove(idx); }
+                                                    }
+                                                });
+                                            }
+                                        }
+                                    }
                                 });
 
                                 ui.with_layout(egui::Layout::right_to_left(egui::Align::TOP), |ui| {
@@ -3215,8 +3499,15 @@ impl App for MyApp {
                                                 if let Some(p) = get_current_config_path() {
                                                     self.config_save_path = p.display().to_string();
                                                 } else {
-                                                    let suggested = format!("CONFIG/config_{}-{}.toml", self.selected_group.to_lowercase(), self.selected_language.chars().take(2).collect::<String>());
-                                                    self.config_save_path = suggested;
+                                                    if self.is_messe {
+                                                        // Suggest a YAML filename for Messe configs
+                                                        let lang_code = get_language_code_variants(&self.selected_language).get(0).cloned().unwrap_or_else(|| self.selected_language.chars().take(2).collect());
+                                                        let suggested = format!("CONFIG/config_messe_{}-{}.yaml", self.selected_group.to_lowercase(), lang_code);
+                                                        self.config_save_path = suggested;
+                                                    } else {
+                                                        let suggested = format!("CONFIG/config_{}-{}.toml", self.selected_group.to_lowercase(), self.selected_language.chars().take(2).collect::<String>());
+                                                        self.config_save_path = suggested;
+                                                    }
                                                 }
                                             }
                                         });
@@ -3517,12 +3808,10 @@ impl App for MyApp {
                                                 }
                                             }
                                         }
-                                        if ui.button("Durchsuchen").clicked() {
-                                            // Open native save dialog
+                                        if ui.button("Durchsuchen...").clicked() {
+                                            // Use native save dialog via rfd
                                             if let Some(path) = rfd::FileDialog::new().set_directory("CONFIG").save_file() {
-                                                if let Some(s) = path.to_str() {
-                                                    self.config_save_path = s.to_string();
-                                                }
+                                                self.config_save_path = path.display().to_string();
                                             }
                                         }
                                         if ui.button("Abbrechen").clicked() {
@@ -3821,18 +4110,18 @@ impl App for MyApp {
                                     ui.group(|ui| {
                                         ui.label("Kundennummer Position (erste Position):");
                                         ui.horizontal(|ui| {
-                                            ui.label("X:");
-                                            ui.text_edit_singleline(&mut self.manual_vertreter_x);
+                                            ui.label("X:").on_hover_text("X-Koordinate in Punkten (links = 0). Benutze die Vorschau zum Feinjustieren.");
+                                            ui.text_edit_singleline(&mut self.manual_vertreter_x).on_hover_text("Gib eine Zahl ein oder benutze die Drag-/Pfeilknöpfe. Beispiel: 50.0");
                                         });
                                         ui.horizontal(|ui| {
-                                            ui.label("Y:");
-                                            ui.text_edit_singleline(&mut self.manual_vertreter_y);
+                                            ui.label("Y:").on_hover_text("Y-Koordinate in Punkten (unten = 0). PDF-Koordinaten beginnen links-unten.");
+                                            ui.text_edit_singleline(&mut self.manual_vertreter_y).on_hover_text("Gib eine Zahl ein oder benutze die Drag-/Pfeilknöpfe. Beispiel: 120.0");
                                         });
                                         ui.horizontal(|ui| {
-                                            ui.label("Größe:");
-                                            ui.text_edit_singleline(&mut self.manual_vertreter_size);
+                                            ui.label("Größe:").on_hover_text("Typografische Größe des Platzhalters in Punkt (pt).");
+                                            ui.text_edit_singleline(&mut self.manual_vertreter_size).on_hover_text("Zahl in pt, z.B. 12.0. Wird beim Speichern verwendet.");
                                         });
-                                        if ui.button("🔄 Kundennummer Position setzen").clicked() {
+                                        if ui.button("🔄 Kundennummer Position setzen").on_hover_text("Setzt die aktuell angezeigte Vertreternummer-Position auf die eingegebenen Werte").clicked() {
                                             if let (Ok(x), Ok(y)) = (
                                                 self.manual_vertreter_x.parse::<f32>(),
                                                 self.manual_vertreter_y.parse::<f32>()
@@ -3858,7 +4147,7 @@ impl App for MyApp {
                             
                             // Speichern/Abbrechen Buttons
                             ui.horizontal(|ui| {
-                                if ui.button("💾 Speichern").clicked() {
+                                if ui.button("💾 Speichern").on_hover_text("Speichert die aktuelle gruppenspezifische Config in die geladene Datei").clicked() {
                                     println!("=== SPEICHERN GEDRÜCKT ===");
                                     println!("VOR Speichern - Config: QR={:?}, Vertreter={:?}", 
                                             self.config.qr_codes, self.config.vertreter);
@@ -3879,7 +4168,8 @@ impl App for MyApp {
                                     }
                                     
                                     self.save_message = Some(std::time::Instant::now());
-                                    self.show_config = false;
+                                    // Request close via the Cell so the final assignment below keeps the state
+                                    close_requested.set(true);
                                     
                                     // Nach dem Speichern nochmal laden um sicherzustellen dass alles stimmt
                                     let loaded_config = load_group_config(&self.selected_group, &self.selected_language, self.is_messe);
@@ -3888,19 +4178,197 @@ impl App for MyApp {
                                     self.config = loaded_config;
                                     println!("=== SPEICHERN ABGESCHLOSSEN ===");
                                 }
-                                if ui.button("❌ Abbrechen").clicked() {
+                                if ui.button("❌ Abbrechen").on_hover_text("Verwirft alle ungespeicherten Änderungen und lädt die Config neu").clicked() {
                                     println!("=== ABBRECHEN GEDRÜCKT ===");
                                     // Gruppenspezifische Config komplett neu laden um alle Änderungen zu verwerfen
                                     self.config = load_group_config(&self.selected_group, &self.selected_language, self.is_messe);
                                     println!("Abgebrochen - gruppenspezifische Config zurückgesetzt: QR={:?}, Vertreter={:?}", 
                                             self.config.qr_codes, self.config.vertreter);
-                                    self.show_config = false;
+                                    // Request close via the Cell so the final assignment below picks it up
+                                    close_requested.set(true);
                                 }
                             });
                         });
                     });
                 });
+                // If any inner control requested a close, reflect that now
+                if close_requested.get() {
+                    show_config = false;
+                }
                 self.show_config = show_config;
+            }
+
+            // Dedicated Elemente verwalten window (always accessible)
+            if self.show_elements_window {
+                egui::Window::new("Elemente verwalten")
+                    .collapsible(false)
+                    .resizable(true)
+                    .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
+                    .show(ctx, |ui| {
+                        ui.heading("Elemente verwalten");
+                        ui.separator();
+
+                        ui.group(|ui| {
+                            ui.label("QR-Codes:").on_hover_text("Verwalte QR-Code Marker, Größe und auf welchen Seiten sie erscheinen.");
+                            ui.horizontal(|ui| {
+                                if ui.button("+ QR-Code hinzufügen").on_hover_text("Fügt einen neuen QR-Code Platzhalter hinzu").clicked() {
+                                    self.config.qr_codes.push(QrCodeConfig { x: 100.0, y: 100.0, size: 18.0, pages: vec![1], all_pages: false });
+                                }
+                                if ui.button("- QR-Code entfernen").on_hover_text("Entfernt das zuletzt hinzugefügte QR-Code Feld").clicked() && !self.config.qr_codes.is_empty() {
+                                    self.config.qr_codes.pop();
+                                }
+                            });
+
+                            for (i, qr) in self.config.qr_codes.iter_mut().enumerate() {
+                                ui.group(|ui| {
+                                    ui.horizontal(|ui| {
+                                        ui.label(format!("QR-Code {} Größe:", i + 1)).on_hover_text("Größe des QR-Codes in Punkt (pt). Größere Werte führen zu größeren QR-Codes im PDF.");
+                                        ui.add(egui::Slider::new(&mut qr.size, 10.0..=50.0).suffix(" pt")).on_hover_text("Ziehe um die Größe des QR-Codes anzupassen (10–50 pt).");
+                                    });
+
+                                    ui.horizontal(|ui| {
+                                        ui.label("Seiten:").on_hover_text("Auf welchen Seiten des PDFs der QR-Code erscheinen soll.");
+                                        if ui.checkbox(&mut qr.all_pages, "Alle Seiten").on_hover_text("Aktiviert diesen QR-Code für alle Seiten und versteckt die per-Seite Liste").clicked() {
+                                            if qr.all_pages {
+                                                qr.pages.clear();
+                                            } else if qr.pages.is_empty() {
+                                                qr.pages.push(1);
+                                            }
+                                        }
+                                    });
+
+                                    if !qr.all_pages {
+                                        ui.horizontal_wrapped(|ui| {
+                                            ui.label("Seiten:").on_hover_text("Liste der Seiten, auf denen der QR-Code erscheinen soll. Füge Seiten hinzu oder entferne sie.");
+                                            let mut pages_to_remove = Vec::new();
+                                            let pages_clone = qr.pages.clone();
+                                            for (pi, page_val) in pages_clone.iter().enumerate() {
+                                                ui.horizontal(|ui| {
+                                                    let mut page_mut = *page_val;
+                                                    if ui.add(egui::DragValue::new(&mut page_mut).clamp_range(1..=100).prefix("S")).on_hover_text("Seitennummer (1..100) auswählen").changed() {
+                                                        qr.pages[pi] = page_mut;
+                                                    }
+                                                    if ui.small_button("❌").on_hover_text("Entferne diese Seite aus der Liste").clicked() && qr.pages.len() > 1 {
+                                                        pages_to_remove.push(pi);
+                                                    }
+                                                });
+                                            }
+                                            for &pi in pages_to_remove.iter().rev() { qr.pages.remove(pi); }
+                                            if ui.small_button("+ Seite").on_hover_text("Fügt eine neue Seite ans Ende der Liste hinzu").clicked() {
+                                                let new_page = qr.pages.iter().max().unwrap_or(&0) + 1;
+                                                qr.pages.push(new_page);
+                                                qr.pages.sort();
+                                            }
+                                        });
+                                    }
+                                });
+                            }
+                        });
+
+                        ui.separator();
+
+                        ui.group(|ui| {
+                            ui.label("Vertreternummer-Felder:").on_hover_text("Verwaltet Platzhalter für Vertreternummern (Schrift, Größe, Seiten).");
+                            ui.horizontal(|ui| {
+                                if ui.button("+ Feld hinzufügen").on_hover_text("Fügt ein neues Vertreter-Feld hinzu").clicked() {
+                                    self.config.vertreter.push(VertreterConfig { x: 100.0, y: 200.0, size: 12.0, pages: vec![1], all_pages: false, font_name: "Arial".to_string(), font_size: 12.0, font_style: "Normal".to_string() });
+                                }
+                                if ui.button("- Feld entfernen").on_hover_text("Entfernt das zuletzt hinzugefügte Vertreter-Feld").clicked() && !self.config.vertreter.is_empty() {
+                                    self.config.vertreter.pop();
+                                }
+                            });
+
+                            for (i, v) in self.config.vertreter.iter_mut().enumerate() {
+                                ui.group(|ui| {
+                                    ui.label(format!("Vertreternummer Feld {}", i + 1)).on_hover_text("Einstellungen für dieses Feld (Position/Schrift/Seiten).");
+                                    ui.horizontal(|ui| {
+                                        ui.label("Schriftart:");
+                                        ui.text_edit_singleline(&mut v.font_name).on_hover_text("Name der Schriftart, z.B. 'Arial' oder eine geladene PDF-Schrift.");
+                                    });
+                                    ui.horizontal(|ui| {
+                                        ui.label("Stil:");
+                                        ui.text_edit_singleline(&mut v.font_style).on_hover_text("Schriftstil, z.B. 'Normal' oder 'Bold'.");
+                                    });
+                                    ui.horizontal(|ui| {
+                                        ui.label("Schriftgröße:");
+                                        ui.add(egui::Slider::new(&mut v.font_size, 6.0..=48.0).suffix(" pt")).on_hover_text("Textgröße in Punkten für die Vertreternummer.");
+                                    });
+
+                                    ui.horizontal(|ui| {
+                                        ui.label("Seiten:").on_hover_text("Auf welchen Seiten dieses Feld erscheinen soll.");
+                                        if ui.checkbox(&mut v.all_pages, "Alle Seiten").on_hover_text("Aktiviert dieses Feld für alle Seiten und blendet die Seitenauswahl aus").clicked() {
+                                            if v.all_pages { v.pages.clear(); } else if v.pages.is_empty() { v.pages.push(1); }
+                                        }
+                                    });
+
+                                    if !v.all_pages {
+                                        ui.horizontal_wrapped(|ui| {
+                                            ui.label("Seiten:").on_hover_text("Liste der Seiten (1..100) für dieses Feld.");
+                                            let mut pages_to_remove = Vec::new();
+                                            let pages_clone = v.pages.clone();
+                                            for (pi, page_val) in pages_clone.iter().enumerate() {
+                                                ui.horizontal(|ui| {
+                                                    let mut page_mut = *page_val;
+                                                    if ui.add(egui::DragValue::new(&mut page_mut).clamp_range(1..=100).prefix("S")).on_hover_text("Seitennummer (1..100)").changed() {
+                                                        v.pages[pi] = page_mut;
+                                                    }
+                                                    if ui.small_button("❌").on_hover_text("Entferne diese Seite").clicked() && v.pages.len() > 1 { pages_to_remove.push(pi); }
+                                                });
+                                            }
+                                            for &pi in pages_to_remove.iter().rev() { v.pages.remove(pi); }
+                                            if ui.small_button("+ Seite").on_hover_text("Fügt eine neue Seite hinzu").clicked() { let new_page = v.pages.iter().max().unwrap_or(&0) + 1; v.pages.push(new_page); v.pages.sort(); }
+                                        });
+                                    }
+                                });
+                            }
+                        });
+
+                        ui.separator();
+                        ui.horizontal(|ui| {
+                            if ui.button("Speichern und schließen").on_hover_text("Speichert die aktuelle Config-Datei und schließt dieses Fenster").clicked() {
+                                // Quick-save behavior
+                                save_group_config(&self.selected_group, &self.selected_language, self.is_messe, &self.config);
+                                self.show_elements_window = false;
+                            }
+                            if ui.button("Schließen").on_hover_text("Schließt dieses Fenster ohne zusätzliches Speichern").clicked() { self.show_elements_window = false; }
+                        });
+                    });
+            }
+
+            // Help modal
+            if self.show_help {
+                egui::Window::new("Kurzhilfe / Anleitung")
+                    .collapsible(false)
+                    .resizable(true)
+                    .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
+                    .show(ctx, |ui| {
+                        ui.heading("Kurzanleitung");
+                        ui.separator();
+                        ui.label("1) Wähle Gruppe und Sprache oben aus.");
+                        ui.label("2) Klicke 'Auswahl treffen', um CSV und Template zu prüfen.");
+                        ui.label("3) Öffne 'Positionen auf DIN A4 konfigurieren' um QR- und Vertreter-Positionen anzupassen.");
+                        ui.label("4) Verwende '⚙ Elemente verwalten' oder das separate Fenster, um Seiten und Schrift auszuwählen.");
+                        ui.label("5) Speichern: 'Speichern' schreibt zurück in die geladene Config-Datei. 'Speichern unter...' erlaubt YAML/TOML-Auswahl.");
+                        ui.separator();
+                        // Show README snippet
+                        if ui.button("README anzeigen (CONFIG/README.txt)").clicked() {
+                            let readme_path = std::path::Path::new("CONFIG/README.txt");
+                            match std::fs::read_to_string(readme_path) {
+                                Ok(s) => {
+                                    // Store content and open a dedicated README window so the help modal doesn't close
+                                    self.readme_text = Some(s);
+                                    self.show_readme_window = true;
+                                }
+                                Err(e) => {
+                                    println!("Fehler beim Lesen von CONFIG/README.txt: {}", e);
+                                    self.readme_text = Some(format!("Fehler beim Lesen der README: {}", e));
+                                    self.show_readme_window = true;
+                                }
+                            }
+                        }
+                        ui.separator();
+                        if ui.button("Schließen").clicked() { self.show_help = false; }
+                    });
             }
             
             // 🎉 MEME-FENSTER 🎉
@@ -3915,6 +4383,35 @@ impl App for MyApp {
                         });
                     });
             }
+
+                // README window (opened from Help modal) - persistent
+                if self.show_readme_window {
+                    egui::Window::new("CONFIG/README.txt")
+                        .collapsible(false)
+                        .resizable(true)
+                        .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
+                        .show(ctx, |ui| {
+                            // Show heading with optional last-modified timestamp
+                            let readme_path = std::path::Path::new("CONFIG/README.txt");
+                            let ts = file_modified_time_str(readme_path);
+                            ui.horizontal(|ui| {
+                                ui.heading("CONFIG/README.txt");
+                                if let Some(t) = ts {
+                                    ui.label(egui::RichText::new(format!("Zuletzt geändert: {}", t)).size(12.0).color(egui::Color32::GRAY));
+                                }
+                            });
+                            ui.separator();
+                            if let Some(text) = &self.readme_text {
+                                egui::ScrollArea::vertical().max_height(400.0).show(ui, |ui| {
+                                    ui.code(text);
+                                });
+                            } else {
+                                ui.label("(README nicht geladen)");
+                            }
+                            ui.separator();
+                            if ui.button("Schließen").clicked() { self.show_readme_window = false; }
+                        });
+                }
         });
     }
 }
@@ -4065,6 +4562,8 @@ static CONFIG_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
 // Track the last-loaded config file path in a safe Mutex for multi-threaded access
 use once_cell::sync::Lazy;
 static CURRENT_CONFIG_PATH: Lazy<std::sync::Mutex<Option<std::path::PathBuf>>> = Lazy::new(|| std::sync::Mutex::new(None));
+// Recent config list (strings) for quick access in UI
+static RECENT_CONFIGS: Lazy<std::sync::Mutex<Vec<String>>> = Lazy::new(|| std::sync::Mutex::new(Vec::new()));
 
 // Funktion um die aktuelle Config zu setzen (threadsafe)
 fn set_current_config(config: &Config) {
@@ -4080,11 +4579,95 @@ fn set_current_config_path(path: &std::path::Path) {
     let mut g = CURRENT_CONFIG_PATH.lock().unwrap();
     *g = Some(path.to_path_buf());
     println!("Aktuelle Config-Datei gesetzt: {:?}", path);
+    // Add to recent list
+    add_recent_config(path);
 }
 
 fn get_current_config_path() -> Option<std::path::PathBuf> {
     let g = CURRENT_CONFIG_PATH.lock().unwrap();
     g.clone()
+}
+
+fn add_recent_config(path: &std::path::Path) {
+    let s = path.display().to_string();
+    let mut list = RECENT_CONFIGS.lock().unwrap();
+    // Remove existing equal entries
+    list.retain(|x| x != &s);
+    // Insert at front
+    list.insert(0, s);
+    // Cap at 12 entries
+    if list.len() > 12 {
+        list.truncate(12);
+    }
+}
+
+fn get_recent_config_list() -> Vec<String> {
+    let list = RECENT_CONFIGS.lock().unwrap();
+    list.clone()
+}
+
+// Return last-modified timestamp string for a file, if available
+fn file_modified_time_str(path: &std::path::Path) -> Option<String> {
+    if let Ok(md) = std::fs::metadata(path) {
+        if let Ok(system_time) = md.modified() {
+            // Convert SystemTime -> chrono DateTime using local timezone
+            let dt: chrono::DateTime<chrono::Local> = chrono::DateTime::from(system_time);
+            return Some(dt.format("%Y-%m-%d %H:%M:%S").to_string());
+        }
+    }
+    None
+}
+
+// Determine a simple source label for a config path
+fn detect_config_source(path: &std::path::Path) -> &'static str {
+    let s = path.display().to_string().to_lowercase();
+    if s.contains("config/presets") || s.contains("config\\presets") { "preset" }
+    else if s.contains("config_messe") || s.contains("messe") { "messe" }
+    else if s.contains("config_") || s.contains("config-") { "group" }
+    else { "unknown" }
+}
+
+// Load a config from an arbitrary path (used by recent-list selection / save-as results)
+fn load_config_from_path(path: &std::path::Path) -> Option<Config> {
+    // Use extension-aware loader to support both TOML and YAML configs
+    match try_load_config_file(path) {
+        Some(cfg) => Some(cfg),
+        None => {
+            eprintln!("Konnte Config-Datei {:?} nicht lesen oder parsen", path);
+            None
+        }
+    }
+}
+
+// Try loading a config file and detect format by extension (yaml/yml -> YAML; else TOML fallback)
+fn try_load_config_file(path: &std::path::Path) -> Option<Config> {
+    match std::fs::read_to_string(path) {
+        Ok(content) => {
+            let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("").to_lowercase();
+            if ext == "yaml" || ext == "yml" || content.trim_start().starts_with("---") {
+                match serde_yaml::from_str::<Config>(&content) {
+                    Ok(cfg) => {
+                        set_current_config_path(path);
+                        println!("✅ YAML-Config geladen von {:?}", path);
+                        return Some(cfg);
+                    }
+                    Err(e) => {
+                        eprintln!("Fehler beim Parsen der YAML-Config {:?}: {}", path, e);
+                        // fall through to try TOML as a last resort
+                    }
+                }
+            }
+            // Fallback: try TOML parser used by the project
+            let cfg = parse_toml_to_config(&content);
+            set_current_config_path(path);
+            println!("✅ TOML-Config geladen von {:?}", path);
+            Some(cfg)
+        }
+        Err(e) => {
+            eprintln!("Konnte Config-Datei {:?} nicht lesen: {}", path, e);
+            None
+        }
+    }
 }
 
 
@@ -4503,7 +5086,7 @@ fn modify_pdf_with_debug(template_path: &str, kundennr: &str, qr_code: &[u8], qr
                 page_number, qr_codes_for_page.len(), vertreter_for_page.len()), debug_enabled);
                 
             process_page_elements(&mut doc, page_id, page_number, &qr_codes_for_page, &vertreter_for_page, 
-                                  kundennr, maybe_image_id, Some(qr_width), debug_enabled);
+                                  kundennr, maybe_image_id, debug_enabled);
         } else {
             debug_print(&format!("Seite {} übersprungen - keine Elemente zu platzieren", page_number), debug_enabled);
         }
@@ -4536,7 +5119,7 @@ fn modify_pdf_with_debug(template_path: &str, kundennr: &str, qr_code: &[u8], qr
 
 fn process_page_elements(doc: &mut Document, page_id: lopdf::ObjectId, _page_number: u32,
                          qr_codes: &[&QrCodeConfig], vertreter_configs: &[&VertreterConfig], 
-                         kundennr: &str, maybe_image_id: Option<lopdf::ObjectId>, maybe_image_width: Option<usize>, _debug_enabled: bool) {
+                         kundennr: &str, maybe_image_id: Option<lopdf::ObjectId>, _debug_enabled: bool) {
     
     let content_stream = doc.get_page_content(page_id).expect("Konnte Seiteninhalt nicht laden");
     let mut content = Content::decode(&content_stream).expect("Konnte Inhalt nicht dekodieren");
@@ -4544,11 +5127,9 @@ fn process_page_elements(doc: &mut Document, page_id: lopdf::ObjectId, _page_num
     // Alle QR-Codes platzieren
     for (i, qr_config) in qr_codes.iter().enumerate() {
         if let Some(_img_id) = maybe_image_id {
-            // Compute image-space -> user-space scale so that the drawn image width equals qr_config.size points
-            let scale = if let Some(w) = maybe_image_width { qr_config.size / (w as f32) } else { qr_config.size };
             content.operations.push(Operation::new("q", vec![]));
             content.operations.push(Operation::new("cm", vec![
-                (scale).into(), 0.into(), 0.into(), (scale).into(), 
+                qr_config.size.into(), 0.into(), 0.into(), qr_config.size.into(), 
                 qr_config.x.into(), qr_config.y.into()
             ]));
             content.operations.push(Operation::new("Do", vec![Object::Name(format!("Im{}", i + 1).into_bytes())]));
