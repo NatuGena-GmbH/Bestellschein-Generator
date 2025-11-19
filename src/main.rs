@@ -21,7 +21,7 @@ fn load_actual_template_for_group(group: &str, language: &str, is_messe: bool) -
         .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
     
     // Try to find template using find_best_template
-    if let Some(template_name) = find_best_template(group, language, if is_messe { Some("messe") } else { None }) {
+    if let Some(template_name) = find_best_template(group, language, is_messe, None) {
         let template_path = exe_dir.join(&template_name);
         if template_path.exists() {
             if let Ok(doc) = Document::load(&template_path) {
@@ -278,6 +278,32 @@ fn resolve_template_path_with_debug(template_path: &str, debug_enabled: bool) ->
     let resolved_path = templates_dir.join(&cleaned_path);
     debug_print(&format!("Template-Pfad aufgelöst: '{}' -> '{}'", template_path, resolved_path.display()), debug_enabled);
     resolved_path
+}
+
+fn get_templates_dir() -> std::path::PathBuf {
+    let (_, _, templates_dir, _, _) = get_release_dirs();
+    templates_dir
+}
+
+fn resolve_template_candidate_with_dir(candidate: &str, templates_dir: &std::path::Path) -> std::path::PathBuf {
+    let candidate_path = std::path::Path::new(candidate);
+    if candidate_path.is_absolute() {
+        return candidate_path.to_path_buf();
+    }
+
+    let normalized = candidate.replace('\\', "/");
+    let trimmed = normalized.trim_start_matches("./");
+    let without_prefix = trimmed
+        .strip_prefix("VORLAGE/")
+        .or_else(|| trimmed.strip_prefix("Vorlage/"))
+        .or_else(|| trimmed.strip_prefix("Vorlagen/"))
+        .unwrap_or(trimmed);
+
+    templates_dir.join(without_prefix)
+}
+
+fn template_candidate_exists(candidate: &str, templates_dir: &std::path::Path) -> bool {
+    resolve_template_candidate_with_dir(candidate, templates_dir).exists()
 }
 
 fn get_default_selections() -> Vec<(String, String, bool)> {
@@ -1022,6 +1048,7 @@ pub struct MyApp {
     show_startup_dialog: bool,
     selected_group: String,
     selected_language: String,
+    selected_country: String,
     is_messe: bool,
     show_config: bool,
     progress: f32,
@@ -1129,8 +1156,9 @@ impl Default for MyApp {
         migrate_global_to_group_configs();
 
         // Standard-Gruppenauswahl beim Start
-        let default_group = "Endkunde".to_string();
-        let default_language = "Deutsch".to_string();
+    let default_group = "Endkunde".to_string();
+    let default_language = "Deutsch".to_string();
+    let default_country = "Deutschland".to_string();
         let default_is_messe = false;
 
         // Gruppenspezifische Config beim Start laden statt globaler Config
@@ -1165,6 +1193,7 @@ impl Default for MyApp {
             show_startup_dialog: true,
             selected_group: default_group,
             selected_language: default_language,
+            selected_country: default_country,
             is_messe: default_is_messe,
             show_config: false,
             progress: 0.0,
@@ -1311,8 +1340,8 @@ fn get_current_selections() -> Option<Vec<(String, String, bool)>> {
     guard.clone()
 }
 
-// Suche die passende Template-Datei in VORLAGE/ basierend auf Gruppe, Sprache und optional Land
-fn find_best_template(group: &str, lang: &str, country: Option<&str>) -> Option<String> {
+// Suche die passende Template-Datei in VORLAGE/ basierend auf Gruppe, Sprache, Messe-Flag und optionalem Zielland
+fn find_best_template(group: &str, lang: &str, is_messe: bool, country: Option<&str>) -> Option<String> {
     let mut candidates = Vec::new();
     // normalize group
     let g = group.replace(' ', "").to_lowercase();
@@ -1332,19 +1361,17 @@ fn find_best_template(group: &str, lang: &str, country: Option<&str>) -> Option<
         }
     };
 
-    // If country was set to "messe" we prefer Messe templates
-    if let Some(ct) = country {
-        if ct.to_lowercase() == "messe" {
-            for code in &codes {
-                candidates.push(format!("VORLAGE/Bestellschein-Messe-{}-{}.pdf", capitalize_first(&g), code));
-                candidates.push(format!("VORLAGE/Bestellschein-Messe-{}-{}.pdf", capitalize_first(&g), code));
-            }
-        } else {
-            // country-specific codes, e.g. at, ch
-            let c = ct.replace(' ', "").to_lowercase();
-            for code in &codes {
-                candidates.push(format!("VORLAGE/Bestellschein-{}-{}_{}.pdf", capitalize_first(&g), code.split('_').next().unwrap_or(code), c));
-            }
+    if is_messe {
+        for code in &codes {
+            candidates.push(format!("VORLAGE/Bestellschein-Messe-{}-{}.pdf", capitalize_first(&g), code));
+            candidates.push(format!("VORLAGE/Bestellschein-Messe-{}-{}.pdf", capitalize_first(&g), code));
+        }
+    }
+
+    if let Some(ct) = country.and_then(|c| canonical_country_tag(c)) {
+        for code in &codes {
+            let lang_prefix = code.split('_').next().unwrap_or(code);
+            candidates.push(format!("VORLAGE/Bestellschein-{}-{}_{}.pdf", capitalize_first(&g), lang_prefix, ct));
         }
     }
 
@@ -1357,10 +1384,9 @@ fn find_best_template(group: &str, lang: &str, country: Option<&str>) -> Option<
     candidates.push(format!("VORLAGE/Bestellschein-{}.pdf", capitalize_first(&g)));
     candidates.push(format!("VORLAGE/Bestellscheine-{}.pdf", capitalize_first(&g)));
 
-    let project_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let templates_dir = get_templates_dir();
     for c in candidates {
-        let abs = project_root.join(&c);
-        if abs.exists() {
+        if template_candidate_exists(&c, &templates_dir) {
             return Some(c);
         }
     }
@@ -1368,7 +1394,7 @@ fn find_best_template(group: &str, lang: &str, country: Option<&str>) -> Option<
 }
 
 // Erweiterte Template-Suche mit benutzerdefiniertem Verzeichnis
-fn find_best_template_in_dir(group: &str, lang: &str, country: Option<&str>, template_dir: &str) -> Option<String> {
+fn find_best_template_in_dir(group: &str, lang: &str, is_messe: bool, country: Option<&str>, template_dir: &str) -> Option<String> {
     let mut candidates = Vec::new();
     // normalize group
     let g = group.replace(' ', "").to_lowercase();
@@ -1388,19 +1414,17 @@ fn find_best_template_in_dir(group: &str, lang: &str, country: Option<&str>, tem
         }
     };
 
-    // If country was set to "messe" we prefer Messe templates
-    if let Some(ct) = country {
-        if ct.to_lowercase() == "messe" {
-            for code in &codes {
-                candidates.push(format!("{}/Bestellschein-Messe-{}-{}.pdf", template_dir, capitalize_first(&g), code));
-                candidates.push(format!("{}/Bestellschein-Messe-{}.pdf", template_dir, capitalize_first(&g)));
-            }
-        } else {
-            // country-specific codes, e.g. at, ch
-            let c = ct.replace(' ', "").to_lowercase();
-            for code in &codes {
-                candidates.push(format!("{}/Bestellschein-{}-{}_{}.pdf", template_dir, capitalize_first(&g), code.split('_').next().unwrap_or(code), c));
-            }
+    if is_messe {
+        for code in &codes {
+            candidates.push(format!("{}/Bestellschein-Messe-{}-{}.pdf", template_dir, capitalize_first(&g), code));
+            candidates.push(format!("{}/Bestellschein-Messe-{}.pdf", template_dir, capitalize_first(&g)));
+        }
+    }
+
+    if let Some(ct) = country.and_then(|c| canonical_country_tag(c)) {
+        for code in &codes {
+            let lang_prefix = code.split('_').next().unwrap_or(code);
+            candidates.push(format!("{}/Bestellschein-{}-{}_{}.pdf", template_dir, capitalize_first(&g), lang_prefix, ct));
         }
     }
 
@@ -1424,8 +1448,16 @@ fn find_best_template_in_dir(group: &str, lang: &str, country: Option<&str>, tem
 }
 
 // Liefere die Kandidatenliste, die find_best_template prüfen würde (für UI-Vorschau)
-fn list_template_candidates(group: &str, lang: &str, is_messe: bool) -> Vec<String> {
+fn list_template_candidates(group: &str, lang: &str, is_messe: bool, country: Option<&str>) -> Vec<String> {
+    use std::collections::HashSet;
+
     let mut candidates = Vec::new();
+    let mut seen = HashSet::new();
+    let mut push_candidate = |entry: String| {
+        if seen.insert(entry.clone()) {
+            candidates.push(entry);
+        }
+    };
     // Reuse mapping logic from find_best_template
     let g = group.replace(' ', "").to_lowercase();
     let lang_lower = lang.replace(' ', "").to_lowercase();
@@ -1437,32 +1469,38 @@ fn list_template_candidates(group: &str, lang: &str, is_messe: bool) -> Vec<Stri
 
     if is_messe {
         for code in &codes {
-            candidates.push(format!("VORLAGE/Bestellschein-Messe-{}-{}.pdf", capitalize_first(&g), code));
-            candidates.push(format!("VORLAGE/Bestellschein-Messe-{}-{}.pdf", capitalize_first(&g), code));
+            push_candidate(format!("VORLAGE/Bestellschein-Messe-{}-{}.pdf", capitalize_first(&g), code));
+            push_candidate(format!("VORLAGE/Bestellschein-Messe-{}.pdf", capitalize_first(&g)));
+        }
+    }
+
+    if let Some(ct) = country.and_then(|c| canonical_country_tag(c)) {
+        for code in &codes {
+            let lang_prefix = code.split('_').next().unwrap_or(code);
+            push_candidate(format!("VORLAGE/Bestellschein-{}-{}_{}.pdf", capitalize_first(&g), lang_prefix, ct));
         }
     }
 
     for code in &codes {
-        candidates.push(format!("VORLAGE/Bestellschein-{}-{}.pdf", capitalize_first(&g), code));
+        push_candidate(format!("VORLAGE/Bestellschein-{}-{}.pdf", capitalize_first(&g), code));
     }
 
-    candidates.push(format!("VORLAGE/Bestellschein-{}.pdf", capitalize_first(&g)));
-    candidates.push(format!("VORLAGE/Bestellscheine-{}.pdf", capitalize_first(&g)));
+    push_candidate(format!("VORLAGE/Bestellschein-{}.pdf", capitalize_first(&g)));
+    push_candidate(format!("VORLAGE/Bestellscheine-{}.pdf", capitalize_first(&g)));
 
     candidates
 }
 
 // Erweiterte Template-Suche mit Bewertung und Sortierung
-fn find_available_templates_with_score(group: &str, lang: &str, is_messe: bool) -> Vec<(String, i32, bool)> {
+fn find_available_templates_with_score(group: &str, lang: &str, is_messe: bool, country: Option<&str>) -> Vec<(String, i32, bool)> {
     let mut results = Vec::new();
-    let project_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let templates_dir = get_templates_dir();
     
     // Basis-Kandidaten generieren
-    let candidates = list_template_candidates(group, lang, is_messe);
+    let candidates = list_template_candidates(group, lang, is_messe, country);
     
     for candidate in candidates {
-        let abs_path = project_root.join(&candidate);
-        let exists = abs_path.exists();
+    let exists = template_candidate_exists(&candidate, &templates_dir);
         
         // Bewertungs-Score basierend auf Übereinstimmung
         let mut score = 0;
@@ -1488,6 +1526,10 @@ fn find_available_templates_with_score(group: &str, lang: &str, is_messe: bool) 
         
         // Sprache passt (verwende robusteren Matcher)
         score += language_match_score(&filename_lower, lang);
+
+        if let Some(ct) = country {
+            score += country_match_score(&filename_lower, ct);
+        }
         
         // Messe passt
         if is_messe && filename_lower.contains("messe") {
@@ -1505,7 +1547,7 @@ fn find_available_templates_with_score(group: &str, lang: &str, is_messe: bool) 
     }
     
     // Auch alle anderen PDF-Dateien im VORLAGE-Ordner scannen
-    if let Ok(entries) = std::fs::read_dir(project_root.join("VORLAGE")) {
+    if let Ok(entries) = std::fs::read_dir(&templates_dir) {
         for entry in entries.flatten() {
             if let Ok(file_type) = entry.file_type() {
                 if file_type.is_file() {
@@ -1523,6 +1565,9 @@ fn find_available_templates_with_score(group: &str, lang: &str, is_messe: bool) 
                                     score += 10;
                                 }
                                 score += language_match_score(&filename_lower, lang);
+                                if let Some(ct) = country {
+                                    score += country_match_score(&filename_lower, ct);
+                                }
                                 if is_messe && filename_lower.contains("messe") {
                                     score += 5;
                                 } else if !is_messe && !filename_lower.contains("messe") {
@@ -1574,6 +1619,75 @@ fn get_preferred_language_codes(request: &str) -> Vec<String> {
     } else {
         vec!["de_de".to_string(), "de".to_string()]
     }
+}
+
+fn get_preferred_country_codes(request: &str) -> Vec<String> {
+    let r = request.trim().to_lowercase();
+    if r.is_empty() {
+        return Vec::new();
+    }
+
+    if r.contains("schweiz") || r.contains("swiss") || r.contains("suisse") || r == "ch" {
+        vec!["ch".to_string(), "che".to_string(), "sui".to_string()]
+    } else if r.contains("deutsch") || r.contains("german") || r.contains("germany") || r == "de" {
+        vec!["de".to_string(), "deu".to_string(), "ger".to_string()]
+    } else if r.contains("öster") || r.contains("austria") || r == "at" {
+        vec!["at".to_string(), "aut".to_string()]
+    } else {
+        vec![r]
+    }
+}
+
+fn canonical_country_tag(request: &str) -> Option<String> {
+    let preferred = get_preferred_country_codes(request);
+    preferred.first().cloned()
+}
+
+fn parse_template_lang_country(path_like: &str) -> (Option<String>, Option<String>) {
+    let filename = std::path::Path::new(path_like)
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or(path_like);
+
+    if let Some(idx) = filename.rfind('-') {
+        let suffix = &filename[idx + 1..];
+        if let Some((lang, country)) = suffix.split_once('_') {
+            return (Some(lang.to_lowercase()), Some(country.to_lowercase()));
+        }
+        return (Some(suffix.to_lowercase()), None);
+    }
+
+    (None, None)
+}
+
+fn country_match_score(filename_lower: &str, country: &str) -> i32 {
+    let preferred = get_preferred_country_codes(country);
+    if preferred.is_empty() {
+        return 0;
+    }
+
+    let (_, file_country) = parse_template_lang_country(filename_lower);
+    let mut score = 0;
+
+    if let Some(file_country) = file_country {
+        if let Some(idx) = preferred.iter().position(|code| code == &file_country) {
+            score += 35 - (idx as i32 * 5);
+        } else if preferred.iter().any(|code| file_country.starts_with(code) || code.starts_with(&file_country)) {
+            score += 15;
+        } else {
+            score -= 6;
+        }
+    } else {
+        score -= 2;
+    }
+
+    for (idx, code) in preferred.iter().enumerate() {
+        if isolated_token_present(filename_lower, code) {
+            score += 10 - (idx as i32 * 2);
+        }
+    }
+
+    score
 }
 
 // Liefert mögliche Varianten eines Sprachkürzels, z.B. für "Deutsch" -> ["de_de","de","DE"]
@@ -1850,9 +1964,9 @@ impl MyApp {
     }
 
     // Template-Suche basierend auf User-Settings
-    fn find_template(&self, group: &str, lang: &str, country: Option<&str>) -> Option<String> {
-        // Prefer using the scored template list so automatic selection respects preferred language codes
-        let templates = self.find_templates_with_score(group, lang, country.is_some() && country.unwrap_or("") == "messe");
+    fn find_template(&self, group: &str, lang: &str, is_messe: bool, country: Option<&str>) -> Option<String> {
+        // Prefer using the scored template list so automatic selection respects preferred language and country codes
+        let templates = self.find_templates_with_score(group, lang, is_messe, country);
 
         if !templates.is_empty() {
             // preferred codes (e.g. en_us, en)
@@ -1881,9 +1995,9 @@ impl MyApp {
 
         // If no scored templates (edge case), fallback to original search
         if self.use_custom_template_dir {
-            find_best_template_in_dir(group, lang, country, &self.custom_template_dir)
+            find_best_template_in_dir(group, lang, is_messe, country, &self.custom_template_dir)
         } else {
-            find_best_template(group, lang, country)
+            find_best_template(group, lang, is_messe, country)
         }
     }
 
@@ -1891,8 +2005,8 @@ impl MyApp {
     // 1) Vorzugsweise vorhandene Template mit preferred language code
     // 2) sonst erstes vorhandenes Template
     // 3) sonst erstes Kandidaten-Template
-    fn select_best_template_auto(&self, group: &str, lang: &str, is_messe: bool) -> Option<String> {
-        let templates = self.find_templates_with_score(group, lang, is_messe);
+    fn select_best_template_auto(&self, group: &str, lang: &str, is_messe: bool, country: Option<&str>) -> Option<String> {
+        let templates = self.find_templates_with_score(group, lang, is_messe, country);
         if templates.is_empty() { return None; }
 
         let preferred_codes = get_preferred_language_codes(lang);
@@ -1919,18 +2033,18 @@ impl MyApp {
     }
 
     // Template-Liste mit Scoring basierend auf User-Settings
-    fn find_templates_with_score(&self, group: &str, lang: &str, is_messe: bool) -> Vec<(String, i32, bool)> {
+    fn find_templates_with_score(&self, group: &str, lang: &str, is_messe: bool, country: Option<&str>) -> Vec<(String, i32, bool)> {
         if self.use_custom_template_dir {
             // Benutzerdefinierter Ordner durchsuchen
-            self.scan_custom_template_dir(group, lang, is_messe)
+            self.scan_custom_template_dir(group, lang, is_messe, country)
         } else {
             // Standard-Funktion verwenden
-            find_available_templates_with_score(group, lang, is_messe)
+            find_available_templates_with_score(group, lang, is_messe, country)
         }
     }
 
     // Scanne den benutzerdefinierten Template-Ordner
-    fn scan_custom_template_dir(&self, group: &str, lang: &str, is_messe: bool) -> Vec<(String, i32, bool)> {
+    fn scan_custom_template_dir(&self, group: &str, lang: &str, is_messe: bool, country: Option<&str>) -> Vec<(String, i32, bool)> {
         let mut results = Vec::new();
         let template_dir = std::path::Path::new(&self.custom_template_dir);
         
@@ -1965,6 +2079,11 @@ impl MyApp {
                                     if filename_lower.contains("en_us") || filename_lower.contains("en") {
                                         score += 8;
                                     }
+                                }
+
+                                // Zielland passt
+                                if let Some(ct) = country {
+                                    score += country_match_score(&filename_lower, ct);
                                 }
                                 
                                 // Messe-Spezifisch
@@ -2201,16 +2320,33 @@ impl App for MyApp {
                             // Build CSV and template from current UI selection
                             let csv_default = get_default_csv_path(&self.selected_group);
                             
-                            let template = self.find_template(&self.selected_group, &self.selected_language, if self.is_messe { Some("messe") } else { None })
+                            let template = self.find_template(
+                                &self.selected_group,
+                                &self.selected_language,
+                                self.is_messe,
+                                Some(&self.selected_country),
+                            )
                                 .unwrap_or_else(|| {
                                     if self.selected_group == "Apo" { "Vorlagen/Bestellscheine-Apo.pdf".to_string() } 
                                     else { get_default_template_path() }
                                 });
 
-                            // Check existence relative to project root
-                            let project_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
-                            let csv_abs = project_root.join(&csv_default);
-                            let template_abs = project_root.join(&template);
+                            // Check existence relative to runtime release directories
+                            let (_, data_dir, templates_dir, _, _) = get_release_dirs_with_debug(self.debug_mode);
+
+                            let csv_abs = {
+                                let csv_path = std::path::Path::new(&csv_default);
+                                if csv_path.is_absolute() {
+                                    csv_path.to_path_buf()
+                                } else {
+                                    let cleaned = csv_default
+                                        .trim_start_matches("Data/")
+                                        .trim_start_matches("DATA/");
+                                    data_dir.join(cleaned)
+                                }
+                            };
+
+                            let template_abs = resolve_template_candidate_with_dir(&template, &templates_dir);
                             let mut missing = Vec::new();
                             if !csv_abs.exists() { missing.push(csv_abs.to_string_lossy().to_string()); }
                             if !template_abs.exists() { missing.push(template_abs.to_string_lossy().to_string()); }
@@ -2759,6 +2895,27 @@ impl App for MyApp {
                     });
 
                     ui.separator();
+                    ui.label("Zielland:");
+                    ui.horizontal(|ui| {
+                        if ui.selectable_label(self.selected_country == "Deutschland", "Deutschland").clicked() {
+                            if self.selected_country != "Deutschland" {
+                                clear_progress_files(&self.selected_group, &self.selected_language, self.is_messe);
+                                self.selected_country = "Deutschland".to_string();
+                                self.resume_info = load_resume_info(&self.selected_group, &self.selected_language, self.is_messe);
+                                println!("Zielland geändert zu Deutschland");
+                            }
+                        }
+                        if ui.selectable_label(self.selected_country == "Schweiz", "Schweiz").clicked() {
+                            if self.selected_country != "Schweiz" {
+                                clear_progress_files(&self.selected_group, &self.selected_language, self.is_messe);
+                                self.selected_country = "Schweiz".to_string();
+                                self.resume_info = load_resume_info(&self.selected_group, &self.selected_language, self.is_messe);
+                                println!("Zielland geändert zu Schweiz");
+                            }
+                        }
+                    });
+
+                    ui.separator();
                     // Anzeige welche Config aktuell verwendet wird (Dateipfad oder Hinweis wenn keine spezifische Datei)
                     ui.horizontal(|ui| {
                         ui.label("Verwendete Config:").on_hover_text("Die Config-Datei, die aktuell geladen ist (falls vorhanden)");
@@ -2861,7 +3018,12 @@ impl App for MyApp {
                     ui.label("📋 Template-Auswahl:");
                     
                     // Templates mit Bewertung laden
-                    let templates_with_score = self.find_templates_with_score(&self.selected_group, &self.selected_language, self.is_messe);
+                    let templates_with_score = self.find_templates_with_score(
+                        &self.selected_group,
+                        &self.selected_language,
+                        self.is_messe,
+                        Some(&self.selected_country),
+                    );
                     
                     if templates_with_score.is_empty() {
                         ui.label("⚠️ Keine Templates gefunden!");
@@ -2947,11 +3109,15 @@ impl App for MyApp {
 
                     // Zeige alte Kandidatenliste für Referenz (eingeklappt)
                     ui.collapsing("🔍 Alle geprüften Kandidaten (Debug)", |ui| {
-                        let candidates = list_template_candidates(&self.selected_group, &self.selected_language, self.is_messe);
-                        let project_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+                        let candidates = list_template_candidates(
+                            &self.selected_group,
+                            &self.selected_language,
+                            self.is_messe,
+                            Some(&self.selected_country),
+                        );
+                        let templates_dir = get_templates_dir();
                         for c in candidates {
-                            let abs = project_root.join(&c);
-                            let exists = abs.exists();
+                            let exists = template_candidate_exists(&c, &templates_dir);
                             if exists {
                                 ui.label(format!("✔ {}", c));
                             } else {
@@ -2973,7 +3139,12 @@ impl App for MyApp {
                                         self.available_templates[index].clone()
                                     } else {
                                         // Fallback auf automatische Erkennung
-                                        self.find_template(&self.selected_group, &self.selected_language, if self.is_messe { Some("messe") } else { None })
+                                        self.find_template(
+                                            &self.selected_group,
+                                            &self.selected_language,
+                                            self.is_messe,
+                                            Some(&self.selected_country),
+                                        )
                                             .unwrap_or_else(|| "VORLAGE/Bestellschein-Endkunde-de_de.pdf".to_string())
                                     }
                                 } else {
@@ -2982,18 +3153,36 @@ impl App for MyApp {
                                 }
                             } else {
                                 // Automatische Erkennung verwenden (jetzt: best-scoring + preferred language)
-                                    self.select_best_template_auto(&self.selected_group, &self.selected_language, self.is_messe)
+                                    self.select_best_template_auto(
+                                        &self.selected_group,
+                                        &self.selected_language,
+                                        self.is_messe,
+                                        Some(&self.selected_country),
+                                    )
                                         .unwrap_or_else(|| if self.selected_group == "Apo" { "VORLAGE/Bestellscheine-Apo.pdf".to_string() } else { "VORLAGE/Bestellschein-Endkunde-de_de.pdf".to_string() })
                             };
                             
                             let gen_qr = true;
                             let csv = csv_default;
 
-                            // Überprüfe ob Dateien existieren
-                            let project_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+                            // Überprüfe ob Dateien existieren (zur Laufzeit)
+                            let (_, data_dir, templates_dir, _, _) = get_release_dirs_with_debug(self.debug_mode);
                             let mut missing = Vec::new();
-                            let csv_abs = project_root.join(&csv);
-                            let template_abs = project_root.join(&template);
+
+                            let csv_abs = {
+                                let csv_path = std::path::Path::new(&csv);
+                                if csv_path.is_absolute() {
+                                    csv_path.to_path_buf()
+                                } else {
+                                    let cleaned = csv
+                                        .trim_start_matches("Data/")
+                                        .trim_start_matches("DATA/");
+                                    data_dir.join(cleaned)
+                                }
+                            };
+
+                            let template_abs = resolve_template_candidate_with_dir(&template, &templates_dir);
+
                             if !csv_abs.exists() { missing.push(format!("CSV: {}", csv_abs.to_string_lossy())); }
                             if !template_abs.exists() { missing.push(format!("Template: {}", template_abs.to_string_lossy())); }
 
@@ -3013,7 +3202,7 @@ impl App for MyApp {
                                 self.config = group_cfg;
                                 // request to close after the closure completes
                                 should_close = true;
-                                self.status_message = format!("Auswahl gesetzt: {} / {}", self.selected_group, self.selected_language);
+                                self.status_message = format!("Auswahl gesetzt: {} / {} / {}", self.selected_group, self.selected_language, self.selected_country);
                             }
                         }
 
